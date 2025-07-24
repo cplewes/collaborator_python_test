@@ -100,7 +100,17 @@ bind_body = f"""
 """
 bind_resp = requests.post(BOSH_URL, headers=headers, data=bind_body.strip())
 bind_resp.raise_for_status()
-jid = ET.fromstring(bind_resp.text).find('.//{urn:ietf:params:xml:ns:xmpp-bind}jid').text
+
+print(f"[DEBUG] Bind response: {bind_resp.text}")
+bind_tree = ET.fromstring(bind_resp.text)
+jid_element = bind_tree.find('.//{urn:ietf:params:xml:ns:xmpp-bind}jid')
+
+if jid_element is None:
+    print("❌ Resource binding failed - no JID returned")
+    print(f"Full response: {bind_resp.text}")
+    raise Exception("Resource binding failed")
+
+jid = jid_element.text
 print(f"[+] Bound to JID: {jid}")
 
 # === Step 5: Start session ===
