@@ -86,10 +86,42 @@ except ET.ParseError as e:
     print(f"Response: {resp.text}")
     raise
 
-# === Step 3: Pre-authenticated - Skip SASL (using JWT token like web client) ===
-print("[+] Using JWT pre-authentication (no SASL required)")
+# === Step 3: SASL Auth (using access token) ===
+rid = rid_manager.next_rid()
+auth_str = f"\x00{username}\x00{access_token}"
+auth_b64 = base64.b64encode(auth_str.encode()).decode()
+auth_body = f"""
+<body rid='{rid}' sid='{sid}' xmlns='http://jabber.org/protocol/httpbind'>
+  <auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='PLAIN'>{auth_b64}</auth>
+</body>
+"""
+try:
+    auth_resp = requests.post(BOSH_URL, headers=headers, data=auth_body.strip())
+    auth_resp.raise_for_status()
+    
+    if "<success" not in auth_resp.text:
+        if "<failure" in auth_resp.text and "not-authorized" in auth_resp.text:
+            print("❌ SASL Authentication failed - Access token may be expired or invalid")
+        elif "<failure" in auth_resp.text:
+            print(f"❌ SASL Authentication failed: {auth_resp.text}")
+        else:
+            print(f"❌ Unexpected authentication response: {auth_resp.text}")
+        raise Exception("Authentication failed")
+    print("[+] SASL Authentication successful with access token")
+except requests.exceptions.HTTPError as e:
+    print(f"❌ SASL request failed: HTTP {auth_resp.status_code}")
+    print(f"Response: {auth_resp.text}")
+    raise
 
-# === Step 4: Resource binding ===
+# === Step 4: Restart stream ===
+rid = rid_manager.next_rid()
+restart_body = f"""
+<body rid='{rid}' sid='{sid}' xmlns='http://jabber.org/protocol/httpbind' to='agfa.com' xml:lang='en' xmpp:restart='true' xmlns:xmpp='urn:xmpp:xbosh'/>
+"""
+requests.post(BOSH_URL, headers=headers, data=restart_body.strip())
+print("[+] Stream restarted")
+
+# === Step 5: Resource binding ===
 rid = rid_manager.next_rid()
 bind_body = f"""
 <body rid='{rid}' sid='{sid}' xmlns='http://jabber.org/protocol/httpbind'>
@@ -101,7 +133,6 @@ bind_body = f"""
 bind_resp = requests.post(BOSH_URL, headers=headers, data=bind_body.strip())
 bind_resp.raise_for_status()
 
-print(f"[DEBUG] Bind response: {bind_resp.text}")
 bind_tree = ET.fromstring(bind_resp.text)
 jid_element = bind_tree.find('.//{urn:ietf:params:xml:ns:xmpp-bind}jid')
 
@@ -113,7 +144,7 @@ if jid_element is None:
 jid = jid_element.text
 print(f"[+] Bound to JID: {jid}")
 
-# === Step 5: Start session ===
+# === Step 6: Start session ===
 rid = rid_manager.next_rid()
 session_body = f"""
 <body rid='{rid}' sid='{sid}' xmlns='http://jabber.org/protocol/httpbind'>
@@ -124,7 +155,7 @@ session_body = f"""
 """
 requests.post(BOSH_URL, headers=headers, data=session_body.strip())
 
-# === Step 6: Send message ===
+# === Step 7: Send message ===
 rid = rid_manager.next_rid()
 msg_body = f"""
 <body rid='{rid}' sid='{sid}' xmlns='http://jabber.org/protocol/httpbind'>
