@@ -3,7 +3,6 @@ import uuid
 import base64
 import xml.etree.ElementTree as ET
 import requests
-import time
 
 # === Configuration ===
 BOSH_URL = "https://abpei-hub-app-north.albertahealthservices.ca:7443/http-bind/"
@@ -20,106 +19,91 @@ message_body = input("Enter message to send: ")
 
 # === Step 1: Get access token from Keycloak ===
 print("[*] Authenticating with Keycloak...")
-resp = requests.post(KEYCLOAK_URL, data={
+token_resp = requests.post(KEYCLOAK_URL, data={
     "grant_type": "password",
     "client_id": CLIENT_ID,
     "username": username,
     "password": password,
     "scope": "openid"
 })
-resp.raise_for_status()
-access_token = resp.json()["access_token"]
+token_resp.raise_for_status()
+access_token = token_resp.json()["access_token"]
 print("[+] Got access token")
 
 headers = {
     "Authorization": f"Bearer {access_token}",
     "Content-Type": "text/xml; charset=utf-8"
 }
-# === Step 2: Initiate BOSH Session ===
-rid = int(time.time() * 1000)
-body = f"""<body rid='{rid}'
-  xmlns='http://jabber.org/protocol/httpbind'
-  to='agfa.com'
-  xml:lang='en'
-  wait='60'
-  hold='1'
-  ver='1.6'
-  xmpp:version='1.0'
-  xmlns:xmpp='urn:xmpp:xbosh'/>"""
 
-resp = requests.post(BOSH_URL, headers=headers, data=body)
+# === Step 2: Start BOSH Session ===
+rid = int(uuid.uuid4().int % 1e10)
+init_body = f"""
+<body rid='{rid}' xmlns='http://jabber.org/protocol/httpbind' to='agfa.com' xml:lang='en' wait='60' hold='1' ver='1.6' xmpp:version='1.0' xmlns:xmpp='urn:xmpp:xbosh'/>
+"""
+resp = requests.post(BOSH_URL, headers=headers, data=init_body.strip())
 resp.raise_for_status()
-xml = ET.fromstring(resp.text)
-sid = xml.attrib["sid"]
+tree = ET.fromstring(resp.text)
+sid = tree.attrib["sid"]
 print(f"[+] Connected, sid: {sid}")
 
-# === Step 3: SASL PLAIN Authentication ===
-authzid = ""
-authcid = username
-passwd = password
-msg = f"{authzid}\x00{authcid}\x00{passwd}"
-auth_b64 = base64.b64encode(msg.encode()).decode()
-
+# === Step 3: SASL Auth ===
 rid += 1
-body = f"""<body rid='{rid}' sid='{sid}'
-  xmlns='http://jabber.org/protocol/httpbind'>
+auth_str = f"\x00{username}\x00{password}"
+auth_b64 = base64.b64encode(auth_str.encode()).decode()
+auth_body = f"""
+<body rid='{rid}' sid='{sid}' xmlns='http://jabber.org/protocol/httpbind'>
   <auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='PLAIN'>{auth_b64}</auth>
-</body>"""
+</body>
+"""
+auth_resp = requests.post(BOSH_URL, headers=headers, data=auth_body.strip())
+auth_resp.raise_for_status()
 
-resp = requests.post(BOSH_URL, headers=headers, data=body)
-resp.raise_for_status()
-if "<success" not in resp.text:
-    print(resp.text)
+if "<success" not in auth_resp.text:
+    print(auth_resp.text)
     raise Exception("❌ Authentication failed")
 print("[+] Authenticated")
 
-# === Step 4: Restart stream after SASL ===
+# === Step 4: Restart stream ===
 rid += 1
-body = f"""<body rid='{rid}' sid='{sid}'
-  xmlns='http://jabber.org/protocol/httpbind'
-  to='agfa.com'
-  xml:lang='en'
-  xmpp:restart='true'
-  xmlns:xmpp='urn:xmpp:xbosh'/>"""
-resp = requests.post(BOSH_URL, headers=headers, data=body)
-resp.raise_for_status()
+restart_body = f"""
+<body rid='{rid}' sid='{sid}' xmlns='http://jabber.org/protocol/httpbind' to='agfa.com' xml:lang='en' xmpp:restart='true' xmlns:xmpp='urn:xmpp:xbosh'/>
+"""
+requests.post(BOSH_URL, headers=headers, data=restart_body.strip())
 
-# === Step 5: Resource Bind ===
+# === Step 5: Resource binding ===
 rid += 1
-body = f"""<body rid='{rid}' sid='{sid}'
-  xmlns='http://jabber.org/protocol/httpbind'>
-  <iq type='set' id='bind_1'
-    xmlns='jabber:client'>
+bind_body = f"""
+<body rid='{rid}' sid='{sid}' xmlns='http://jabber.org/protocol/httpbind'>
+  <iq type='set' id='bind_1' xmlns='jabber:client'>
     <bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>
   </iq>
-</body>"""
-resp = requests.post(BOSH_URL, headers=headers, data=body)
-resp.raise_for_status()
-jid = ET.fromstring(resp.text).find('.//{urn:ietf:params:xml:ns:xmpp-bind}jid').text
-print(f"[+] Bound JID: {jid}")
+</body>
+"""
+bind_resp = requests.post(BOSH_URL, headers=headers, data=bind_body.strip())
+bind_resp.raise_for_status()
+jid = ET.fromstring(bind_resp.text).find('.//{urn:ietf:params:xml:ns:xmpp-bind}jid').text
+print(f"[+] Bound to JID: {jid}")
 
-# === Step 6: Establish Session ===
+# === Step 6: Start session ===
 rid += 1
-body = f"""<body rid='{rid}' sid='{sid}'
-  xmlns='http://jabber.org/protocol/httpbind'>
-  <iq type='set' id='sess_1'
-    xmlns='jabber:client'>
+session_body = f"""
+<body rid='{rid}' sid='{sid}' xmlns='http://jabber.org/protocol/httpbind'>
+  <iq to='agfa.com' type='set' id='sess_1' xmlns='jabber:client'>
     <session xmlns='urn:ietf:params:xml:ns:xmpp-session'/>
   </iq>
-</body>"""
-resp = requests.post(BOSH_URL, headers=headers, data=body)
-resp.raise_for_status()
+</body>
+"""
+requests.post(BOSH_URL, headers=headers, data=session_body.strip())
 
-# === Step 7: Send Message ===
+# === Step 7: Send message ===
 rid += 1
-msg_id = str(uuid.uuid4())
-body = f"""<body rid='{rid}' sid='{sid}'
-  xmlns='http://jabber.org/protocol/httpbind'>
-  <message to='{target_jid}' type='chat' id='{msg_id}'
-    xmlns='jabber:client'>
+msg_body = f"""
+<body rid='{rid}' sid='{sid}' xmlns='http://jabber.org/protocol/httpbind'>
+  <message to='{target_jid}' type='chat' xmlns='jabber:client'>
     <body>{message_body}</body>
   </message>
-</body>"""
-resp = requests.post(BOSH_URL, headers=headers, data=body)
-resp.raise_for_status()
-print(f"[+] Message sent to {target_jid}")
+</body>
+"""
+msg_resp = requests.post(BOSH_URL, headers=headers, data=msg_body.strip())
+msg_resp.raise_for_status()
+print("[+] Message sent.")
