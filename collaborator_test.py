@@ -19,35 +19,75 @@ message_body = input("Enter message to send: ")
 
 # === Step 1: Get access token from Keycloak ===
 print("[*] Authenticating with Keycloak...")
-token_resp = requests.post(KEYCLOAK_URL, data={
-    "grant_type": "password",
-    "client_id": CLIENT_ID,
-    "username": username,
-    "password": password,
-    "scope": "openid"
-})
-token_resp.raise_for_status()
-access_token = token_resp.json()["access_token"]
-print("[+] Got access token")
+try:
+    token_resp = requests.post(KEYCLOAK_URL, data={
+        "grant_type": "password",
+        "client_id": CLIENT_ID,
+        "username": username,
+        "password": password,
+        "scope": "openid"
+    })
+    token_resp.raise_for_status()
+    access_token = token_resp.json()["access_token"]
+    print("[+] Got access token")
+except requests.exceptions.HTTPError as e:
+    if token_resp.status_code == 401:
+        print("❌ Authentication failed - Invalid username/password")
+    elif token_resp.status_code == 400:
+        print("❌ Bad request - Check if targetIdp=LDAP1 is included in URL")
+    else:
+        print(f"❌ HTTP Error {token_resp.status_code}: {token_resp.text}")
+    raise
+except requests.exceptions.RequestException as e:
+    print(f"❌ Network error: {e}")
+    raise
 
 headers = {
     "Authorization": f"Bearer {access_token}",
-    "Content-Type": "text/xml; charset=utf-8"
+    "Content-Type": "text/xml; charset=UTF-8",
+    "Origin": "https://abpei-hub-app-north.albertahealthservices.ca",
+    "Referer": "https://abpei-hub-app-north.albertahealthservices.ca/",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Accept": "text/xml, application/xml, application/xhtml+xml, text/html;q=0.9, text/plain;q=0.8, text/css, image/*;q=0.5, */*;q=0.1",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin"
 }
 
 # === Step 2: Start BOSH Session ===
-rid = int(uuid.uuid4().int % 1e10)
+class RIDManager:
+    def __init__(self):
+        self.rid = int(uuid.uuid4().int % 1e10)
+    
+    def next_rid(self):
+        self.rid += 1
+        return self.rid
+
+rid_manager = RIDManager()
+rid = rid_manager.next_rid()
 init_body = f"""
 <body rid='{rid}' xmlns='http://jabber.org/protocol/httpbind' to='agfa.com' xml:lang='en' wait='60' hold='1' ver='1.6' xmpp:version='1.0' xmlns:xmpp='urn:xmpp:xbosh'/>
 """
-resp = requests.post(BOSH_URL, headers=headers, data=init_body.strip())
-resp.raise_for_status()
-tree = ET.fromstring(resp.text)
-sid = tree.attrib["sid"]
-print(f"[+] Connected, sid: {sid}")
+try:
+    resp = requests.post(BOSH_URL, headers=headers, data=init_body.strip())
+    resp.raise_for_status()
+    tree = ET.fromstring(resp.text)
+    sid = tree.attrib["sid"]
+    print(f"[+] Connected, sid: {sid}")
+except requests.exceptions.HTTPError as e:
+    print(f"❌ BOSH connection failed: HTTP {resp.status_code}")
+    print(f"Response: {resp.text}")
+    raise
+except ET.ParseError as e:
+    print(f"❌ Invalid XML response from BOSH server: {e}")
+    print(f"Response: {resp.text}")
+    raise
 
 # === Step 3: SASL Auth ===
-rid += 1
+rid = rid_manager.next_rid()
 auth_str = f"\x00{username}\x00{password}"
 auth_b64 = base64.b64encode(auth_str.encode()).decode()
 auth_body = f"""
@@ -55,23 +95,33 @@ auth_body = f"""
   <auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='PLAIN'>{auth_b64}</auth>
 </body>
 """
-auth_resp = requests.post(BOSH_URL, headers=headers, data=auth_body.strip())
-auth_resp.raise_for_status()
-
-if "<success" not in auth_resp.text:
-    print(auth_resp.text)
-    raise Exception("❌ Authentication failed")
-print("[+] Authenticated")
+try:
+    auth_resp = requests.post(BOSH_URL, headers=headers, data=auth_body.strip())
+    auth_resp.raise_for_status()
+    
+    if "<success" not in auth_resp.text:
+        if "<failure" in auth_resp.text and "not-authorized" in auth_resp.text:
+            print("❌ SASL Authentication failed - Token may be expired or invalid")
+        elif "<failure" in auth_resp.text:
+            print(f"❌ SASL Authentication failed: {auth_resp.text}")
+        else:
+            print(f"❌ Unexpected authentication response: {auth_resp.text}")
+        raise Exception("Authentication failed")
+    print("[+] Authenticated")
+except requests.exceptions.HTTPError as e:
+    print(f"❌ SASL request failed: HTTP {auth_resp.status_code}")
+    print(f"Response: {auth_resp.text}")
+    raise
 
 # === Step 4: Restart stream ===
-rid += 1
+rid = rid_manager.next_rid()
 restart_body = f"""
 <body rid='{rid}' sid='{sid}' xmlns='http://jabber.org/protocol/httpbind' to='agfa.com' xml:lang='en' xmpp:restart='true' xmlns:xmpp='urn:xmpp:xbosh'/>
 """
 requests.post(BOSH_URL, headers=headers, data=restart_body.strip())
 
 # === Step 5: Resource binding ===
-rid += 1
+rid = rid_manager.next_rid()
 bind_body = f"""
 <body rid='{rid}' sid='{sid}' xmlns='http://jabber.org/protocol/httpbind'>
   <iq type='set' id='bind_1' xmlns='jabber:client'>
@@ -85,7 +135,7 @@ jid = ET.fromstring(bind_resp.text).find('.//{urn:ietf:params:xml:ns:xmpp-bind}j
 print(f"[+] Bound to JID: {jid}")
 
 # === Step 6: Start session ===
-rid += 1
+rid = rid_manager.next_rid()
 session_body = f"""
 <body rid='{rid}' sid='{sid}' xmlns='http://jabber.org/protocol/httpbind'>
   <iq to='agfa.com' type='set' id='sess_1' xmlns='jabber:client'>
@@ -96,7 +146,7 @@ session_body = f"""
 requests.post(BOSH_URL, headers=headers, data=session_body.strip())
 
 # === Step 7: Send message ===
-rid += 1
+rid = rid_manager.next_rid()
 msg_body = f"""
 <body rid='{rid}' sid='{sid}' xmlns='http://jabber.org/protocol/httpbind'>
   <message to='{target_jid}' type='chat' xmlns='jabber:client'>
