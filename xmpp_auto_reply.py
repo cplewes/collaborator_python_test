@@ -150,6 +150,15 @@ class XMPPAutoReplyBot:
         
         self.jid = jid_element.text
         print(f"[+] Bound to JID: {self.jid}")
+        
+        # Extract and debug resource information
+        if '/' in self.jid:
+            bare_jid, resource = self.jid.split('/', 1)
+            print(f"[DEBUG] Bare JID: {bare_jid}")
+            print(f"[DEBUG] Our Resource: {resource}")
+            print("[DEBUG] Other clients on same bare JID will compete for messages")
+        else:
+            print("[DEBUG] Warning: No resource in JID - this is unusual")
 
         # Start session
         rid = self.rid_manager.next_rid()
@@ -162,6 +171,36 @@ class XMPPAutoReplyBot:
         """
         self.session.post(BOSH_URL, data=session_body.strip())
         print("[+] XMPP session established")
+        
+        # Set high priority presence to receive messages (fix for multi-client conflicts)
+        self.set_high_priority_presence()
+
+    def set_high_priority_presence(self):
+        """Set high priority presence to win message routing vs other clients"""
+        if not self.sid:
+            return
+        
+        rid = self.rid_manager.next_rid()
+        # Set priority to +10 to beat most web clients (usually 0-5)
+        presence_body = f"""
+        <body rid='{rid}' sid='{self.sid}' xmlns='http://jabber.org/protocol/httpbind'>
+          <presence xmlns='jabber:client'>
+            <priority>10</priority>
+            <status>Auto-reply bot active</status>
+            <show>chat</show>
+          </presence>
+        </body>
+        """
+        
+        print("[DEBUG] Setting high priority presence to win message routing...")
+        try:
+            presence_resp = self.session.post(BOSH_URL, data=presence_body.strip())
+            presence_resp.raise_for_status()
+            print("[+] High priority presence set (priority: 10)")
+            print(f"[DEBUG] Our JID: {self.jid}")
+            print("[DEBUG] This should make us the preferred client for incoming messages")
+        except Exception as e:
+            print(f"❌ Failed to set presence: {e}")
 
     def send_message(self, to_jid, message_body, include_receipt=True):
         """Send a message to specified JID"""
@@ -465,7 +504,17 @@ def main():
             bot.configure_auto_reply(custom_config)
         
         print(f"\n[+] Bot is ready! Monitoring messages for {bot.jid}")
+        print("[+] High priority presence set - should receive messages over other clients")
         print("[+] Press Ctrl+C to stop")
+        
+        # Optional: Send test message to self to verify routing
+        test_choice = input("Send test message to yourself to test routing? (y/n): ").lower()
+        if test_choice == 'y':
+            bare_jid = bot.jid.split('/')[0] if '/' in bot.jid else bot.jid
+            if bot.send_message(bare_jid, "🤖 Test message from auto-reply bot - checking message routing"):
+                print("[+] Test message sent - watch to see which client receives it!")
+            else:
+                print("❌ Failed to send test message")
         
         # Start message loop
         bot.message_loop()
