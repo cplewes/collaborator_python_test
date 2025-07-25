@@ -6,6 +6,7 @@ import xml.etree.ElementTree as ET
 import time
 import threading
 import json
+import queue
 from datetime import datetime
 
 # === Configuration ===
@@ -31,6 +32,11 @@ class XMPPAutoReplyBot:
         self.jid = None
         self.access_token = None
         self.running = False
+        
+        # Threading infrastructure for concurrent processing
+        self.message_queue = queue.Queue()
+        self.polling_thread = None
+        self.processor_thread = None
         self.auto_reply_config = {
             "enabled": True,
             "delay_seconds": 2,
@@ -454,72 +460,144 @@ class XMPPAutoReplyBot:
             print(f"[DEBUG] Error details: {type(e).__name__}")
             return []
 
-    def message_loop(self):
-        """Main message receiving and auto-reply loop"""
-        print("[+] Starting message loop with enhanced debugging...")
-        print(f"[DEBUG] Bot JID: {self.jid}")
-        print(f"[DEBUG] Session ID: {self.sid}")
-        print("[DEBUG] Starting continuous BOSH polling...")
-        
-        self.running = True
+    def polling_worker(self):
+        """Continuous BOSH polling worker thread - runs in background"""
+        print("[DEBUG] Starting polling worker thread...")
         poll_count = 0
         
         while self.running:
             try:
                 poll_count += 1
-                print(f"\n[DEBUG] === Poll Cycle #{poll_count} ===")
+                print(f"[DEBUG] Polling thread - cycle #{poll_count}")
                 
-                # Poll for messages
+                # Poll for messages (non-blocking from main thread perspective)
                 messages = self.poll_messages()
                 
-                if messages:
-                    print(f"[DEBUG] Processing {len(messages)} messages...")
-                    
+                # Queue any messages for immediate processing
                 for message in messages:
-                    print(f"\n📨 *** NEW MESSAGE RECEIVED ***")
-                    print(f"From: {message['from']}")
-                    print(f"To: {message['to']}")
-                    print(f"Body: {message['body']}")
-                    print(f"ID: {message['id']}")
-                    print(f"Receipt requested: {message['receipt_requested']}")
-                    print(f"Timestamp: {message['timestamp']}")
-                    
-                    # Send receipt if requested
-                    if message['receipt_requested']:
-                        self.send_receipt(message['from'], message['id'])
-                        print(f"✅ Sent receipt for message {message['id']}")
-                    
-                    # Generate and send auto-reply
-                    reply = self.generate_auto_reply(message)
-                    if reply:
-                        print(f"[DEBUG] Generated auto-reply: '{reply}'")
-                        # Wait configured delay before replying
-                        print(f"[DEBUG] Waiting {self.auto_reply_config['delay_seconds']} seconds before reply...")
-                        time.sleep(self.auto_reply_config["delay_seconds"])
-                        
-                        if self.send_message(message['from'], reply):
-                            print(f"🤖 Auto-replied to {message['from']}: {reply}")
-                        else:
-                            print(f"❌ Failed to send auto-reply to {message['from']}")
-                    else:
-                        print("[DEBUG] No auto-reply configured for this message")
+                    print(f"[DEBUG] Queuing message for immediate processing: {message['from']}")
+                    self.message_queue.put(message)
                 
+                # Brief pause only if no messages (let BOSH handle timing otherwise)
                 if not messages:
-                    print(f"[DEBUG] Poll cycle {poll_count} complete - no messages")
-                
-                # No sleep between polls - BOSH handles timing with wait/hold
-                
-            except KeyboardInterrupt:
-                print("\n[*] Stopping message loop...")
-                self.running = False
-                break
+                    time.sleep(0.1)  # Very short pause to prevent CPU spinning
+                    
             except Exception as e:
-                print(f"❌ Message loop error: {e}")
-                print(f"[DEBUG] Exception in poll cycle {poll_count}")
+                print(f"❌ Polling worker error: {e}")
+                print(f"[DEBUG] Error in polling thread")
                 import traceback
                 traceback.print_exc()
-                print("[DEBUG] Waiting 5 seconds before retry...")
                 time.sleep(5)  # Wait before retrying
+        
+        print("[DEBUG] Polling worker thread stopped")
+
+    def message_processor(self):
+        """Message processing worker thread - handles auto-replies immediately"""
+        print("[DEBUG] Starting message processor thread...")
+        
+        while self.running:
+            try:
+                # Get message from queue (with timeout to allow clean shutdown)
+                try:
+                    message = self.message_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue  # Check if still running and retry
+                
+                print(f"\n📨 *** IMMEDIATE MESSAGE PROCESSING ***")
+                print(f"From: {message['from']}")
+                print(f"To: {message['to']}")
+                print(f"Body: {message['body']}")
+                print(f"ID: {message['id']}")
+                print(f"Receipt requested: {message['receipt_requested']}")
+                print(f"Timestamp: {message['timestamp']}")
+                
+                # Send receipt if requested (immediate)
+                if message['receipt_requested']:
+                    self.send_receipt(message['from'], message['id'])
+                    print(f"✅ Sent receipt for message {message['id']}")
+                
+                # Generate and send auto-reply (immediate)
+                reply = self.generate_auto_reply(message)
+                if reply:
+                    print(f"[DEBUG] Generated auto-reply: '{reply}'")
+                    print(f"[DEBUG] Waiting {self.auto_reply_config['delay_seconds']} seconds before reply...")
+                    time.sleep(self.auto_reply_config["delay_seconds"])
+                    
+                    if self.send_message(message['from'], reply):
+                        print(f"🤖 Auto-replied to {message['from']}: {reply}")
+                    else:
+                        print(f"❌ Failed to send auto-reply to {message['from']}")
+                else:
+                    print("[DEBUG] No auto-reply configured for this message")
+                
+                # Mark task as done
+                self.message_queue.task_done()
+                
+            except Exception as e:
+                print(f"❌ Message processor error: {e}")
+                print(f"[DEBUG] Error in message processing thread")
+                import traceback
+                traceback.print_exc()
+                # Continue processing other messages
+        
+        print("[DEBUG] Message processor thread stopped")
+
+    def message_loop(self):
+        """Main message receiving and auto-reply loop - now with concurrent processing"""
+        print("[+] Starting concurrent message processing...")
+        print(f"[DEBUG] Bot JID: {self.jid}")
+        print(f"[DEBUG] Session ID: {self.sid}")
+        print("[DEBUG] Starting background threads for immediate response...")
+        
+        self.running = True
+        
+        try:
+            # Start background polling thread
+            self.polling_thread = threading.Thread(target=self.polling_worker, daemon=True)
+            self.polling_thread.start()
+            print("[DEBUG] Polling thread started")
+            
+            # Start background message processing thread
+            self.processor_thread = threading.Thread(target=self.message_processor, daemon=True)
+            self.processor_thread.start()
+            print("[DEBUG] Message processor thread started")
+            
+            print("\n🚀 *** CONCURRENT PROCESSING ACTIVE ***")
+            print("📡 Polling thread: Continuous BOSH polling in background")
+            print("⚡ Processor thread: Immediate auto-reply processing")
+            print("🔥 Expected response time: ~2 seconds (configured delay)")
+            print("\n[+] Bot is now ready for immediate auto-replies!")
+            print("[+] Press Ctrl+C to stop")
+            
+            # Main thread just waits and monitors
+            while self.running:
+                time.sleep(1)
+                
+                # Optional: Show queue status periodically
+                queue_size = self.message_queue.qsize()
+                if queue_size > 0:
+                    print(f"[DEBUG] Message queue size: {queue_size}")
+                
+        except KeyboardInterrupt:
+            print("\n[*] Stopping concurrent processing...")
+            self.running = False
+            
+            # Wait for threads to finish
+            if self.polling_thread and self.polling_thread.is_alive():
+                print("[DEBUG] Waiting for polling thread to stop...")
+                self.polling_thread.join(timeout=5)
+            
+            if self.processor_thread and self.processor_thread.is_alive():
+                print("[DEBUG] Waiting for processor thread to stop...")
+                self.processor_thread.join(timeout=5)
+            
+            print("[DEBUG] All threads stopped")
+            
+        except Exception as e:
+            print(f"❌ Message loop error: {e}")
+            import traceback
+            traceback.print_exc()
+            self.running = False
 
     def stop(self):
         """Stop the message loop"""
