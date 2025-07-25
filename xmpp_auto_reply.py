@@ -39,7 +39,10 @@ class XMPPAutoReplyBot:
                 "hello": "Hello! How can I help you?",
                 "help": "I'm currently away but will respond as soon as possible.",
                 "status": "I'm currently online via auto-reply bot."
-            }
+            },
+            "filter_self_messages": True,
+            "filter_bot_messages": True,
+            "bot_indicators": ['🤖', 'auto-reply', 'automated', 'bot', 'testing autoreply']
         }
         self.processed_messages = set()  # Track processed message IDs
     
@@ -202,6 +205,23 @@ class XMPPAutoReplyBot:
         except Exception as e:
             print(f"❌ Failed to set presence: {e}")
 
+    def is_self_message(self, from_jid):
+        """Check if a message is from the bot itself to prevent infinite loops"""
+        if not self.jid:
+            return False
+        
+        # Compare full JIDs (exact match)
+        if from_jid == self.jid:
+            return True
+        
+        # Compare bare JIDs (same user, different resource)
+        our_bare_jid = self.jid.split('/')[0] if '/' in self.jid else self.jid
+        sender_bare_jid = from_jid.split('/')[0] if '/' in from_jid else from_jid
+        
+        # For now, filter all messages from same bare JID to be safe
+        # This prevents loops from any resource of the same user
+        return our_bare_jid == sender_bare_jid
+
     def send_message(self, to_jid, message_body, include_receipt=True):
         """Send a message to specified JID"""
         if not self.sid:
@@ -315,6 +335,17 @@ class XMPPAutoReplyBot:
                             break
                     
                     if body_text and from_jid:
+                        # CRITICAL: Filter out self-messages to prevent infinite loops
+                        if self.is_self_message(from_jid):
+                            print(f"[DEBUG] *** FILTERING SELF-MESSAGE ***")
+                            print(f"[DEBUG] Message from: {from_jid}")
+                            print(f"[DEBUG] Our JID: {self.jid}")
+                            print(f"[DEBUG] Body: '{body_text}'")
+                            print(f"[DEBUG] Self-message ignored to prevent infinite loop")
+                            continue
+                        
+                        print(f"[DEBUG] Message from external sender - processing...")
+                        
                         if not msg_id:
                             msg_id = f"auto_generated_{int(time.time() * 1000)}"
                         
@@ -329,7 +360,7 @@ class XMPPAutoReplyBot:
                             }
                             messages.append(message_data)
                             self.processed_messages.add(msg_id)
-                            print(f"[DEBUG] Added message to processing queue: {message_data}")
+                            print(f"[DEBUG] Added external message to processing queue: {message_data}")
                         else:
                             print(f"[DEBUG] Message {msg_id} already processed, skipping")
                     else:
@@ -349,16 +380,34 @@ class XMPPAutoReplyBot:
     def generate_auto_reply(self, incoming_message):
         """Generate auto-reply based on incoming message content"""
         if not self.auto_reply_config["enabled"]:
+            print("[DEBUG] Auto-reply disabled")
+            return None
+        
+        # Additional safety check to prevent loops
+        if self.is_self_message(incoming_message['from']):
+            print("[DEBUG] Skipping auto-reply for self-message (double-check)")
             return None
         
         body = incoming_message['body'].lower().strip()
         
+        # Check if this looks like a bot message to prevent reply loops
+        if self.auto_reply_config.get("filter_bot_messages", True):
+            bot_indicators = self.auto_reply_config.get("bot_indicators", [])
+            if any(indicator in body for indicator in bot_indicators):
+                print(f"[DEBUG] Message contains bot indicators: {body}")
+                print("[DEBUG] Skipping auto-reply to prevent bot-to-bot loops")
+                return None
+        
+        print(f"[DEBUG] Generating auto-reply for message: '{body}'")
+        
         # Check for custom replies
         for trigger, reply in self.auto_reply_config["custom_replies"].items():
             if trigger in body:
+                print(f"[DEBUG] Matched custom trigger: '{trigger}' -> '{reply}'")
                 return reply
         
         # Default reply
+        print(f"[DEBUG] Using default reply: '{self.auto_reply_config['default_reply']}'")
         return self.auto_reply_config["default_reply"]
 
     def poll_messages(self):
