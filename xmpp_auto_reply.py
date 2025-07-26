@@ -37,6 +37,7 @@ class XMPPAutoReplyBot:
         self.message_queue = queue.Queue()
         self.polling_thread = None
         self.processor_thread = None
+        self.console_thread = None
         self.auto_reply_config = {
             "enabled": True,
             "delay_seconds": 2,
@@ -612,6 +613,68 @@ class XMPPAutoReplyBot:
         
         print("[DEBUG] Polling worker thread stopped")
 
+    def console_input_worker(self):
+        """Console input worker thread - handles direct user command input"""
+        print("[DEBUG] Starting console input thread...")
+        
+        while self.running:
+            try:
+                # Show prompt and get user input
+                user_input = input("Bot> ").strip()
+                
+                if not user_input:
+                    continue
+                
+                # Handle special commands
+                if user_input.lower() in ['quit', 'exit', 'stop']:
+                    print("[*] Stopping bot...")
+                    self.running = False
+                    break
+                elif user_input.lower() in ['help', '?']:
+                    self.show_help()
+                    continue
+                
+                # Process as command (add leading slash if missing)
+                if not user_input.startswith('/'):
+                    user_input = '/' + user_input
+                
+                print(f"[DEBUG] Processing console command: {user_input}")
+                self.process_user_command(user_input)
+                
+            except EOFError:
+                # Handle Ctrl+D
+                print("\n[*] EOF received, stopping bot...")
+                self.running = False
+                break
+            except KeyboardInterrupt:
+                # Handle Ctrl+C in input thread
+                print("\n[*] Interrupt received, stopping bot...")
+                self.running = False
+                break
+            except Exception as e:
+                print(f"❌ Console input error: {e}")
+                # Continue processing other input
+        
+        print("[DEBUG] Console input thread stopped")
+
+    def show_help(self):
+        """Show help information"""
+        print("\n🤖 *** XMPP AUTO-REPLY BOT COMMANDS ***")
+        print("\nPresence Commands:")
+        print("  status <message>      - Set status message")
+        print("  show <state> [msg]    - Set show state (online/away/dnd/chat/xa)")
+        print("  priority <number>     - Set presence priority")
+        print("\nTesting Commands:")
+        print("  test                  - Run security injection tests")
+        print("\nGeneral Commands:")
+        print("  help                  - Show this help")
+        print("  quit                  - Stop the bot")
+        print("\nNotes:")
+        print("- Commands can be typed with or without leading '/'")
+        print("- XMPP messages to yourself starting with '/' also work")
+        print("- Press Ctrl+C to stop at any time")
+        print()
+
     def process_user_command(self, command_text):
         """Process interactive commands from user input"""
         parts = command_text.strip().split(' ', 2)
@@ -751,28 +814,39 @@ class XMPPAutoReplyBot:
             self.processor_thread.start()
             print("[DEBUG] Message processor thread started")
             
+            # Start console input thread
+            self.console_thread = threading.Thread(target=self.console_input_worker, daemon=True)
+            self.console_thread.start()
+            print("[DEBUG] Console input thread started")
+            
             print("\n🚀 *** CONCURRENT PROCESSING ACTIVE ***")
             print("📡 Polling thread: Continuous BOSH polling in background")
             print("⚡ Processor thread: Immediate auto-reply processing")
+            print("💬 Console thread: Direct command input")
             print("🔥 Expected response time: ~2 seconds (configured delay)")
-            print("\n🤖 *** INTERACTIVE PRESENCE COMMANDS ***")
-            print("Send yourself messages starting with '/' to control presence:")
-            print("  /status <message>     - Set status message")
-            print("  /show <state> [msg]  - Set show state (online/away/dnd/chat/xa)")
-            print("  /priority <number>   - Set presence priority")
-            print("  /test                - Run security injection tests")
-            print("  /help                - Show all commands")
-            print("\n[+] Bot is now ready for immediate auto-replies!")
-            print("[+] Press Ctrl+C to stop")
+            print("\n🤖 *** INTERACTIVE COMMANDS ***")
+            print("Type commands directly (with or without leading '/'):")
+            print("  status <message>     - Set status message")
+            print("  show <state> [msg]   - Set show state (online/away/dnd/chat/xa)")
+            print("  priority <number>    - Set presence priority")
+            print("  test                 - Run security injection tests")
+            print("  help                 - Show all commands")
+            print("  quit                 - Stop the bot")
+            print("\nAlternatively, send yourself XMPP messages starting with '/' for remote control")
+            print("\n[+] Bot is ready! Type 'help' for commands or 'quit' to stop")
             
-            # Main thread just waits and monitors
+            # Main thread waits for shutdown signal
             while self.running:
-                time.sleep(1)
+                time.sleep(0.5)
                 
-                # Optional: Show queue status periodically
-                queue_size = self.message_queue.qsize()
-                if queue_size > 0:
-                    print(f"[DEBUG] Message queue size: {queue_size}")
+                # Check if all threads are still alive
+                if not self.polling_thread.is_alive():
+                    print("[WARNING] Polling thread died")
+                if not self.processor_thread.is_alive():
+                    print("[WARNING] Processor thread died")
+                if not self.console_thread.is_alive():
+                    print("[WARNING] Console thread died")
+                    break
                 
         except KeyboardInterrupt:
             print("\n[*] Stopping concurrent processing...")
@@ -786,6 +860,10 @@ class XMPPAutoReplyBot:
             if self.processor_thread and self.processor_thread.is_alive():
                 print("[DEBUG] Waiting for processor thread to stop...")
                 self.processor_thread.join(timeout=5)
+            
+            if self.console_thread and self.console_thread.is_alive():
+                print("[DEBUG] Waiting for console thread to stop...")
+                self.console_thread.join(timeout=2)
             
             print("[DEBUG] All threads stopped")
             
