@@ -589,17 +589,19 @@ class StudyMonitorPOC:
         if not self.clario_tool or not self.clario_tool.session:
             raise Exception("Clario not connected")
         
+        # Match working client payload structure exactly
         payload = {
-            "data": [method, params],
-            "tid": self.clario_tool._get_next_transaction_id(),
-            "login": self.clario_login_id,
-            "app": app,
             "action": "rpc",
             "method": method_type,
+            "data": [method, params],
+            "tid": self.clario_tool._get_next_transaction_id(),
+            "app": app,
+            "login": self.clario_login_id if self.clario_login_id else 0,
         }
         
-        # Debug logging for RPC requests
-        logger.debug("RPC Request: %s", json.dumps(payload, indent=2))
+        # Debug logging for RPC requests (redact sensitive data)
+        debug_payload = {**payload, "data": [method, "[ARGS_REDACTED]" if params else []]}
+        logger.debug("RPC Request: %s", json.dumps(debug_payload, indent=2))
         
         rpc_url = f"/rpc/app.php?app={app}&sysClient="
         logger.debug("RPC URL: %s", rpc_url)
@@ -609,21 +611,26 @@ class StudyMonitorPOC:
                 "POST", rpc_url, json=payload
             )
             
-            logger.debug("RPC Response: status=%d, data=%s", status_code, 
-                        json.dumps(response_data, indent=2) if isinstance(response_data, (dict, list)) else str(response_data))
+            logger.debug("RPC Response: status=%d, type=%s", status_code, type(response_data).__name__)
             
+            # Parse response like working client
             if isinstance(response_data, list) and len(response_data) > 0:
-                result = response_data[0].get("result")
-                if result is None:
-                    # Check for error in response
-                    error = response_data[0].get("error")
-                    if error:
-                        raise Exception(f"RPC error: {error}")
-                    else:
-                        raise Exception(f"No result in RPC response: {response_data[0]}")
-                return result
+                result = response_data[0]
+                logger.debug("RPC response keys: %s", list(result.keys()) if isinstance(result, dict) else "non-dict")
+                
+                if "result" in result:
+                    logger.debug("RPC call successful (app=%s, method=%s)", app, method)
+                    return result["result"]
+                elif "error" in result:
+                    error_msg = result["error"]
+                    logger.error("RPC call failed (app=%s, method=%s): %s", app, method, error_msg)
+                    raise Exception(f"RPC Error: {error_msg}")
+                else:
+                    logger.error("No result or error in RPC response: %s", result)
+                    raise Exception(f"No result or error in RPC response: {result}")
             else:
-                raise Exception(f"Invalid RPC response format: {type(response_data)} - {response_data}")
+                logger.error("Unexpected RPC response format (app=%s, method=%s): %s", app, method, response_data)
+                raise Exception(f"Unexpected response format: {response_data}")
                 
         except Exception as e:
             logger.error("RPC call failed for %s.%s: %s", app, method, str(e))
@@ -638,14 +645,14 @@ class StudyMonitorPOC:
         logger.debug("Sending heartbeat for login_id: %d", self.clario_login_id)
 
         try:
-            # Use correct method type and app based on working login code
+            # Try using session preparation as heartbeat (matches working client pattern)
             result = await self._rpc_call(
-                "login", "login/Access.userActive", [True, 50000, "home"], method_type="direct"
+                "login", "login/Prepare.user", [self.clario_login_id, None], method_type="direct"
             )
             logger.debug("Heartbeat successful (result=%s)", result)
             return True
         except Exception as e:
-            logger.debug("Heartbeat failed: %s", str(e))
+            logger.error("Heartbeat failed: %s", str(e))
             return False
     
     def detect_study_share_urls(self, message_body: str) -> List[str]:
@@ -653,19 +660,31 @@ class StudyMonitorPOC:
         if not message_body:
             return []
         
-        pattern = r'https://share\\.study\\.link[^\\s]*'
+        # Fixed regex pattern - use single backslashes for proper escaping
+        pattern = r'https://share\.study\.link[^\s]*'
         urls = re.findall(pattern, message_body, re.IGNORECASE)
+        
+        if urls:
+            print(f"[DEBUG] Detected {len(urls)} study share URL(s): {urls}")
+        else:
+            print(f"[DEBUG] No study share URLs found in message: '{message_body[:100]}{'...' if len(message_body) > 100 else ''}'")
+        
         return urls
     
     def parse_study_share_url(self, url: str) -> Optional[Dict[str, Any]]:
         """Parse study share URL and extract metadata."""
+        print(f"[DEBUG] Parsing study share URL: {url}")
+        
         try:
             parsed = urllib.parse.urlparse(url)
+            print(f"[DEBUG] Parsed URL - netloc: {parsed.netloc}, query: {parsed.query}")
             
             if not parsed.netloc.lower() == 'share.study.link':
+                print(f"[DEBUG] Wrong netloc: expected 'share.study.link', got '{parsed.netloc}'")
                 return None
             
             params = urllib.parse.parse_qs(parsed.query)
+            print(f"[DEBUG] URL parameters: {list(params.keys())}")
             
             # Validate required parameters
             required_params = ['studyUID', 'patientId', 'issuer', 'procedure', 'id']
@@ -673,6 +692,7 @@ class StudyMonitorPOC:
             
             if missing_params:
                 print(f"[DEBUG] Missing required parameters: {missing_params}")
+                print(f"[DEBUG] Available parameters: {list(params.keys())}")
                 return None
             
             study_info = {}
@@ -682,44 +702,60 @@ class StudyMonitorPOC:
                 try:
                     study_uid_b64 = params['studyUID'][0]
                     study_info['studyUID'] = base64.b64decode(study_uid_b64).decode('utf-8')
-                except Exception:
+                    print(f"[DEBUG] Decoded studyUID: {study_info['studyUID']}")
+                except Exception as e:
+                    print(f"[DEBUG] Failed to decode studyUID, using raw: {e}")
                     study_info['studyUID'] = study_uid_b64
             
             if 'patientId' in params:
                 try:
                     patient_id_b64 = params['patientId'][0]
                     study_info['patientId'] = base64.b64decode(patient_id_b64).decode('utf-8')
-                except Exception:
+                    print(f"[DEBUG] Decoded patientId: {study_info['patientId']}")
+                except Exception as e:
+                    print(f"[DEBUG] Failed to decode patientId, using raw: {e}")
                     study_info['patientId'] = patient_id_b64
             
             if 'procedure' in params:
-                study_info['procedure'] = urllib.parse.unquote(params['procedure'][0])
+                raw_procedure = params['procedure'][0]
+                study_info['procedure'] = urllib.parse.unquote(raw_procedure)
+                print(f"[DEBUG] Decoded procedure: '{study_info['procedure']}'")
             
             # Add other fields
             for field in ['issuer', 'id']:
                 if field in params:
                     study_info[field] = urllib.parse.unquote(params[field][0])
+                    print(f"[DEBUG] Decoded {field}: {study_info[field]}")
             
             study_info['raw_url'] = url
+            print(f"[DEBUG] Successfully parsed study info: {study_info}")
             return study_info
             
         except Exception as e:
             print(f"❌ Failed to parse study share URL: {e}")
+            print(f"[DEBUG] URL that failed: {url}")
+            import traceback
+            print(f"[DEBUG] Full error: {traceback.format_exc()}")
             return None
     
     def extract_accession_from_procedure(self, procedure: str) -> Optional[str]:
         """Extract accession number (last word) from procedure string."""
         if not procedure:
+            print(f"[DEBUG] No procedure provided for accession extraction")
             return None
+        
+        print(f"[DEBUG] Extracting accession from procedure: '{procedure}'")
         
         # Split by whitespace and get the last word
         words = procedure.strip().split()
         if words:
             accession = words[-1]
             print(f"[DEBUG] Extracted accession '{accession}' from procedure: {procedure}")
+            print(f"[DEBUG] All words in procedure: {words}")
             return accession
-        
-        return None
+        else:
+            print(f"[DEBUG] No words found in procedure string")
+            return None
     
     async def process_study_share(self, from_jid: str, study_info: Dict[str, Any]):
         """Process a detected study share and lookup patient details."""
@@ -958,13 +994,21 @@ class StudyMonitorPOC:
                 
                 # Check for study share URLs
                 study_urls = self.detect_study_share_urls(message['body'])
-                for url in study_urls:
-                    study_info = self.parse_study_share_url(url)
-                    if study_info:
-                        # Process study share asynchronously
-                        self.clario_loop.run_until_complete(
-                            self.process_study_share(message['from'], study_info)
-                        )
+                if study_urls:
+                    print(f"[DEBUG] Processing {len(study_urls)} study share URL(s)")
+                    for url in study_urls:
+                        print(f"[DEBUG] Processing URL: {url}")
+                        study_info = self.parse_study_share_url(url)
+                        if study_info:
+                            print(f"[DEBUG] URL parsed successfully, processing study share")
+                            # Process study share asynchronously
+                            self.clario_loop.run_until_complete(
+                                self.process_study_share(message['from'], study_info)
+                            )
+                        else:
+                            print(f"[DEBUG] Failed to parse URL: {url}")
+                else:
+                    print(f"[DEBUG] No study share URLs detected in message")
                 
                 self.message_queue.task_done()
                 
