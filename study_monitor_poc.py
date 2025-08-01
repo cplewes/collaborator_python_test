@@ -424,10 +424,12 @@ class StudyMonitorPOC:
         self.message_queue = queue.Queue()
         self.polling_thread = None
         self.processor_thread = None
+        self.heartbeat_thread = None
         
         # Clario components
         self.clario_tool = None
         self.clario_loop = None
+        self.clario_login_id = None
         
         # Track processed messages
         self.processed_messages = set()
@@ -528,21 +530,100 @@ class StudyMonitorPOC:
             self.session.post(BOSH_URL, data=session_body.strip())
             print("[+] XMPP session established")
             
+            # Set high priority presence to receive messages (fix for multi-client conflicts)
+            self.set_high_priority_presence()
+            
             return True
             
         except Exception as e:
             print(f"❌ XMPP authentication failed: {e}")
             return False
     
+    def set_high_priority_presence(self):
+        """Set high priority presence to win message routing vs other clients"""
+        if not self.sid:
+            return
+        
+        rid = self.rid_manager.next_rid()
+        # Set priority to +10 to beat most web clients (usually 0-5)
+        presence_body = f"""
+        <body rid='{rid}' sid='{self.sid}' xmlns='http://jabber.org/protocol/httpbind'>
+          <presence xmlns='jabber:client'>
+            <priority>10</priority>
+            <status>Study Monitor POC active</status>
+            <show>chat</show>
+          </presence>
+        </body>
+        """
+        
+        print("[DEBUG] Setting high priority presence to win message routing...")
+        try:
+            presence_resp = self.session.post(BOSH_URL, data=presence_body.strip())
+            presence_resp.raise_for_status()
+            print("[+] High priority presence set (priority: 10)")
+            print(f"[DEBUG] Our JID: {self.jid}")
+            print("[DEBUG] This should make us the preferred client for incoming messages")
+        except Exception as e:
+            print(f"❌ Failed to set presence: {e}")
+    
     async def authenticate_clario(self, username: str, password: str) -> bool:
         """Authenticate with Clario."""
         try:
             self.clario_tool = ClarionSearchTool(CLARIO_BASE_URL, username, password)
             await self.clario_tool.connect()
-            print("[+] Clario authentication successful")
+            
+            # Extract login_id for heartbeat functionality
+            if hasattr(self.clario_tool, 'session_token') and self.clario_tool.session_token:
+                self.clario_login_id = int(self.clario_tool.session_token)
+                print(f"[+] Clario authentication successful (login_id={self.clario_login_id})")
+            else:
+                print("[+] Clario authentication successful")
+            
             return True
         except Exception as e:
             print(f"❌ Clario authentication failed: {e}")
+            return False
+    
+    async def _rpc_call(self, app: str, method: str, params: List, method_type: str = "direct"):
+        """Helper method for Clario RPC calls."""
+        if not self.clario_tool or not self.clario_tool.session:
+            raise Exception("Clario not connected")
+        
+        payload = {
+            "data": [method, params],
+            "tid": self.clario_tool._get_next_transaction_id(),
+            "login": self.clario_login_id,
+            "app": app,
+            "action": "rpc",
+            "method": method_type,
+        }
+        
+        rpc_url = f"/rpc/app.php?app={app}&sysClient="
+        status_code, response_data, headers = await self.clario_tool._make_request(
+            "POST", rpc_url, json=payload
+        )
+        
+        if isinstance(response_data, list) and len(response_data) > 0:
+            return response_data[0].get("result")
+        else:
+            raise Exception("Invalid RPC response format")
+    
+    async def heartbeat(self) -> bool:
+        """Send keep-alive heartbeat to Clario."""
+        if not self.clario_login_id:
+            logger.debug("Heartbeat skipped - not logged in")
+            return False
+
+        logger.debug("Sending heartbeat for login_id: %d", self.clario_login_id)
+
+        try:
+            result = await self._rpc_call(
+                "home", "login/Access.userActive", [True, 50000, "home"], method_type="one"
+            )
+            logger.debug("Heartbeat successful (result=%s)", result)
+            return True
+        except Exception as e:
+            logger.debug("Heartbeat failed: %s", str(e))
             return False
     
     def detect_study_share_urls(self, message_body: str) -> List[str]:
@@ -677,22 +758,43 @@ class StudyMonitorPOC:
         print(json.dumps(output, indent=2))
     
     def poll_messages(self) -> List[Dict[str, Any]]:
-        """Poll for incoming XMPP messages."""
+        """Poll for incoming XMPP messages with comprehensive debugging."""
         if not self.sid:
+            print("[DEBUG] Cannot poll - no session ID")
             return []
         
         rid = self.rid_manager.next_rid()
         poll_body = f"""<body rid='{rid}' sid='{self.sid}' xmlns='http://jabber.org/protocol/httpbind' wait='60' hold='1'/>"""
         
+        poll_start = time.time()
+        print(f"[DEBUG] BOSH Poll Request (RID: {rid}): Starting long-poll to {BOSH_URL}")
+        
         try:
             resp = self.session.post(BOSH_URL, data=poll_body.strip(), timeout=65)
+            poll_duration = time.time() - poll_start
             resp.raise_for_status()
+            
+            print(f"[DEBUG] BOSH Poll Response: Status={resp.status_code}, Duration={poll_duration:.2f}s, Size={len(resp.text)} bytes")
+            
+            # Debug the raw response periodically
+            if int(time.time()) % 30 == 0:  # Every 30 seconds
+                print(f"[DEBUG] Raw BOSH Response: {resp.text[:200]}{'...' if len(resp.text) > 200 else ''}")
             
             messages = []
             root = ET.fromstring(resp.text)
             
+            # Check for ack attribute in response
+            ack_value = root.get('ack')
+            if ack_value:
+                print(f"[DEBUG] Server ACK: {ack_value}")
+            
+            # Count total elements for debugging
+            total_elements = len(list(root.iter()))
+            message_elements = 0
+            
             for message in root.iter():
                 if message.tag.endswith('message') and message.get('type') == 'chat':
+                    message_elements += 1
                     from_jid = message.get('from', '')
                     to_jid = message.get('to', '')
                     msg_id = message.get('id', '')
@@ -702,6 +804,9 @@ class StudyMonitorPOC:
                         if elem.tag.endswith('body'):
                             body_text = elem.text or ''
                             break
+                    
+                    print(f"[DEBUG] Message Element: From={from_jid}, To={to_jid}, ID={msg_id}")
+                    print(f"[DEBUG] Message Body Preview: '{body_text[:50]}{'...' if len(body_text) > 50 else ''}'")
                     
                     if body_text and from_jid:
                         if msg_id not in self.processed_messages:
@@ -714,11 +819,25 @@ class StudyMonitorPOC:
                             }
                             messages.append(message_data)
                             self.processed_messages.add(msg_id)
+                            print(f"[DEBUG] Added message to queue: {msg_id}")
+                        else:
+                            print(f"[DEBUG] Skipped duplicate message: {msg_id}")
+            
+            print(f"[DEBUG] BOSH Parse Summary: {total_elements} total elements, {message_elements} message elements, {len(messages)} new messages")
+            
+            if len(messages) == 0:
+                print("[DEBUG] Empty poll response - waiting for next cycle")
             
             return messages
             
+        except requests.exceptions.Timeout:
+            poll_duration = time.time() - poll_start
+            print(f"[DEBUG] BOSH poll timeout after {poll_duration:.2f}s (normal for long-polling)")
+            return []
         except Exception as e:
-            print(f"❌ Polling error: {e}")
+            poll_duration = time.time() - poll_start  
+            print(f"❌ Polling error after {poll_duration:.2f}s: {e}")
+            print(f"[DEBUG] Error type: {type(e).__name__}")
             return []
     
     def polling_worker(self):
@@ -739,6 +858,43 @@ class StudyMonitorPOC:
                 time.sleep(5)
         
         print("[DEBUG] XMPP polling thread stopped")
+    
+    def heartbeat_worker(self):
+        """Clario heartbeat worker thread - sends periodic keep-alives."""
+        print("[DEBUG] Starting Clario heartbeat thread...")
+        
+        # Create event loop for async heartbeat calls
+        heartbeat_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(heartbeat_loop)
+        
+        heartbeat_count = 0
+        
+        while self.running:
+            try:
+                if self.clario_login_id:
+                    heartbeat_count += 1
+                    print(f"[DEBUG] Sending Clario heartbeat #{heartbeat_count}")
+                    
+                    success = heartbeat_loop.run_until_complete(self.heartbeat())
+                    if success:
+                        print(f"[DEBUG] Heartbeat #{heartbeat_count} successful")
+                    else:
+                        print(f"[DEBUG] Heartbeat #{heartbeat_count} failed")
+                else:
+                    print("[DEBUG] Heartbeat skipped - no Clario login_id")
+                
+                # Send heartbeat every 30 seconds
+                for i in range(30):
+                    if not self.running:
+                        break
+                    time.sleep(1)
+                    
+            except Exception as e:
+                print(f"❌ Heartbeat worker error: {e}")
+                time.sleep(10)  # Wait before retry
+        
+        heartbeat_loop.close()
+        print("[DEBUG] Clario heartbeat thread stopped")
     
     def message_processor(self):
         """Message processing worker thread."""
@@ -794,13 +950,31 @@ class StudyMonitorPOC:
             # Start threads
             self.polling_thread = threading.Thread(target=self.polling_worker, daemon=True)
             self.polling_thread.start()
+            print("[DEBUG] XMPP polling thread started")
             
             self.processor_thread = threading.Thread(target=self.message_processor, daemon=True)
             self.processor_thread.start()
+            print("[DEBUG] Message processor thread started")
             
-            # Main loop
+            # Start heartbeat thread if we have Clario login
+            if self.clario_login_id:
+                self.heartbeat_thread = threading.Thread(target=self.heartbeat_worker, daemon=True)
+                self.heartbeat_thread.start()
+                print("[DEBUG] Clario heartbeat thread started")
+            else:
+                print("[DEBUG] Clario heartbeat thread skipped - no login_id")
+            
+            # Main loop with thread monitoring
             while self.running:
-                time.sleep(1)
+                time.sleep(5)  # Check every 5 seconds
+                
+                # Monitor thread health
+                if not self.polling_thread.is_alive():
+                    print("❌ XMPP polling thread died!")
+                if not self.processor_thread.is_alive():
+                    print("❌ Message processor thread died!")
+                if self.heartbeat_thread and not self.heartbeat_thread.is_alive():
+                    print("❌ Clario heartbeat thread died!")
                 
         except KeyboardInterrupt:
             print("\\n[*] Stopping study monitoring...")
@@ -808,10 +982,16 @@ class StudyMonitorPOC:
             
             # Wait for threads
             if self.polling_thread and self.polling_thread.is_alive():
+                print("[DEBUG] Waiting for XMPP polling thread...")
                 self.polling_thread.join(timeout=5)
             
             if self.processor_thread and self.processor_thread.is_alive():
+                print("[DEBUG] Waiting for message processor thread...")
                 self.processor_thread.join(timeout=5)
+            
+            if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+                print("[DEBUG] Waiting for heartbeat thread...")
+                self.heartbeat_thread.join(timeout=5)
             
             print("[DEBUG] All threads stopped")
 
