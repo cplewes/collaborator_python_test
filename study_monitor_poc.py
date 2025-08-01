@@ -885,25 +885,29 @@ class StudyMonitorPOC:
         """Clario heartbeat worker thread - sends periodic keep-alives."""
         print("[DEBUG] Starting Clario heartbeat thread...")
         
-        # Create event loop for async heartbeat calls
-        heartbeat_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(heartbeat_loop)
-        
         heartbeat_count = 0
         
         while self.running:
             try:
-                if self.clario_login_id:
+                if self.clario_login_id and self.clario_loop and not self.clario_loop.is_closed():
                     heartbeat_count += 1
                     print(f"[DEBUG] Sending Clario heartbeat #{heartbeat_count}")
                     
-                    success = heartbeat_loop.run_until_complete(self.heartbeat())
-                    if success:
-                        print(f"[DEBUG] Heartbeat #{heartbeat_count} successful")
-                    else:
-                        print(f"[DEBUG] Heartbeat #{heartbeat_count} failed")
-                else:
+                    # Use the existing event loop from message processor thread
+                    future = asyncio.run_coroutine_threadsafe(self.heartbeat(), self.clario_loop)
+                    try:
+                        success = future.result(timeout=10)  # 10 second timeout
+                        if success:
+                            print(f"[DEBUG] Heartbeat #{heartbeat_count} successful")
+                        else:
+                            print(f"[DEBUG] Heartbeat #{heartbeat_count} failed")
+                    except Exception as e:
+                        print(f"[DEBUG] Heartbeat #{heartbeat_count} failed: {e}")
+                        
+                elif not self.clario_login_id:
                     print("[DEBUG] Heartbeat skipped - no Clario login_id")
+                else:
+                    print("[DEBUG] Heartbeat skipped - event loop not available")
                 
                 # Send heartbeat every 30 seconds
                 for i in range(30):
@@ -915,7 +919,6 @@ class StudyMonitorPOC:
                 print(f"❌ Heartbeat worker error: {e}")
                 time.sleep(10)  # Wait before retry
         
-        heartbeat_loop.close()
         print("[DEBUG] Clario heartbeat thread stopped")
     
     def message_processor(self):
