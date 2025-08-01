@@ -7,6 +7,8 @@ import time
 import threading
 import json
 import queue
+import re
+import urllib.parse
 from datetime import datetime
 
 # === Configuration ===
@@ -331,6 +333,198 @@ class XMPPAutoReplyBot:
                 print(f"  Payload: {payload}")
         
         return results
+
+    def detect_study_share_urls(self, message_body):
+        """Detect study share URLs in message body"""
+        if not message_body:
+            return []
+        
+        # Regex pattern to match https://share.study.link URLs
+        pattern = r'https://share\.study\.link[^\s]*'
+        urls = re.findall(pattern, message_body, re.IGNORECASE)
+        
+        print(f"[DEBUG] Found {len(urls)} study share URLs in message")
+        for url in urls:
+            print(f"[DEBUG] Study URL: {url}")
+        
+        return urls
+
+    def parse_study_share_url(self, url):
+        """Parse study share URL and extract metadata"""
+        try:
+            # Parse the URL
+            parsed = urllib.parse.urlparse(url)
+            
+            if not parsed.netloc.lower() == 'share.study.link':
+                print(f"[DEBUG] Not a valid study share URL: {url}")
+                return None
+            
+            # Parse query parameters
+            params = urllib.parse.parse_qs(parsed.query)
+            
+            study_info = {}
+            
+            # Extract and decode studyUID (Base64)
+            if 'studyUID' in params:
+                try:
+                    study_uid_b64 = params['studyUID'][0]
+                    study_info['studyUID'] = base64.b64decode(study_uid_b64).decode('utf-8')
+                    print(f"[DEBUG] Decoded studyUID: {study_info['studyUID']}")
+                except Exception as e:
+                    print(f"[DEBUG] Failed to decode studyUID: {e}")
+                    study_info['studyUID'] = study_uid_b64  # Keep encoded if decode fails
+            
+            # Extract and decode patientId (Base64)
+            if 'patientId' in params:
+                try:
+                    patient_id_b64 = params['patientId'][0]
+                    study_info['patientId'] = base64.b64decode(patient_id_b64).decode('utf-8')
+                    print(f"[DEBUG] Decoded patientId: {study_info['patientId']}")
+                except Exception as e:
+                    print(f"[DEBUG] Failed to decode patientId: {e}")
+                    study_info['patientId'] = patient_id_b64  # Keep encoded if decode fails
+            
+            # Extract URL-encoded fields
+            if 'issuer' in params:
+                study_info['issuer'] = urllib.parse.unquote(params['issuer'][0])
+                print(f"[DEBUG] Decoded issuer: {study_info['issuer']}")
+            
+            if 'procedure' in params:
+                study_info['procedure'] = urllib.parse.unquote(params['procedure'][0])
+                print(f"[DEBUG] Decoded procedure: {study_info['procedure']}")
+            
+            if 'id' in params:
+                study_info['id'] = urllib.parse.unquote(params['id'][0])
+                print(f"[DEBUG] Decoded id: {study_info['id']}")
+            
+            # Add raw URL for reference
+            study_info['raw_url'] = url
+            
+            return study_info
+            
+        except Exception as e:
+            print(f"❌ Failed to parse study share URL: {e}")
+            print(f"[DEBUG] URL: {url}")
+            return None
+
+    def process_study_share(self, from_jid, study_info):
+        """Process a detected study share"""
+        print(f"\n🏥 *** STUDY SHARED DETECTED ***")
+        print(f"Shared by: {from_jid}")
+        print(f"Timestamp: {datetime.now()}")
+        
+        # Display extracted information
+        print(f"\n📋 Study Information:")
+        for key, value in study_info.items():
+            if key != 'raw_url':  # Don't repeat the full URL
+                print(f"  {key}: {value}")
+        
+        print(f"\n🔗 Raw URL: {study_info.get('raw_url', 'N/A')}")
+        
+        # Log to a structured format for potential future processing
+        study_event = {
+            'timestamp': datetime.now().isoformat(),
+            'from_jid': from_jid,
+            'study_info': study_info,
+            'event_type': 'study_shared'
+        }
+        
+        # Could be extended to save to file, database, etc.
+        print(f"[DEBUG] Study event logged: {json.dumps(study_event, indent=2)}")
+        
+        return study_event
+
+    def test_study_url_parsing(self):
+        """Test study share URL parsing with sample URLs"""
+        print("\n🧪 *** STUDY URL PARSING TESTS ***")
+        print("Testing various study share URL formats...")
+        
+        # Create test URLs with encoded data (simulating the Java code)
+        test_cases = [
+            # Test case 1: Basic study share
+            {
+                'name': 'Basic Study Share',
+                'studyUID': 'TEST.STUDY.123.456',
+                'patientId': 'PATIENT001',
+                'issuer': 'RADIOLOGY',
+                'procedure': 'CT Chest with Contrast',
+                'id': 'rpq-12345'
+            },
+            # Test case 2: Complex procedure name
+            {
+                'name': 'Complex Procedure',
+                'studyUID': '1.2.3.4.5.6.7.8.9',
+                'patientId': 'PAT-2024-001',
+                'issuer': 'Emergency Department',
+                'procedure': 'MRI Brain w/ & w/o Contrast + MRA',
+                'id': 'rpq-67890'
+            }
+        ]
+        
+        for i, test_case in enumerate(test_cases, 1):
+            print(f"\n[TEST {i}] {test_case['name']}")
+            
+            # Build URL like the Java code does
+            study_uid_b64 = base64.b64encode(test_case['studyUID'].encode('utf-8')).decode('utf-8')
+            patient_id_b64 = base64.b64encode(test_case['patientId'].encode('utf-8')).decode('utf-8')
+            issuer_encoded = urllib.parse.quote(test_case['issuer'])
+            procedure_encoded = urllib.parse.quote(test_case['procedure'])
+            id_encoded = urllib.parse.quote(test_case['id'])
+            
+            test_url = f"https://share.study.link?studyUID={study_uid_b64}&patientId={patient_id_b64}&issuer={issuer_encoded}&procedure={procedure_encoded}&id={id_encoded}"
+            
+            print(f"Generated URL: {test_url}")
+            
+            # Test detection
+            urls = self.detect_study_share_urls(f"Please review this study: {test_url}")
+            if urls:
+                print(f"✅ URL detected successfully")
+                
+                # Test parsing
+                study_info = self.parse_study_share_url(urls[0])
+                if study_info:
+                    print(f"✅ URL parsed successfully")
+                    
+                    # Verify decoded values match original
+                    print(f"\nVerification:")
+                    print(f"  Original studyUID: '{test_case['studyUID']}'")
+                    print(f"  Decoded studyUID:  '{study_info.get('studyUID', 'MISSING')}'")
+                    print(f"  Match: {'✅' if study_info.get('studyUID') == test_case['studyUID'] else '❌'}")
+                    
+                    print(f"  Original patientId: '{test_case['patientId']}'")
+                    print(f"  Decoded patientId:  '{study_info.get('patientId', 'MISSING')}'")
+                    print(f"  Match: {'✅' if study_info.get('patientId') == test_case['patientId'] else '❌'}")
+                    
+                    print(f"  Original procedure: '{test_case['procedure']}'")
+                    print(f"  Decoded procedure:  '{study_info.get('procedure', 'MISSING')}'")
+                    print(f"  Match: {'✅' if study_info.get('procedure') == test_case['procedure'] else '❌'}")
+                    
+                else:
+                    print(f"❌ URL parsing failed")
+            else:
+                print(f"❌ URL detection failed")
+        
+        # Test invalid URLs
+        print(f"\n[TEST INVALID] Invalid URL handling")
+        invalid_urls = [
+            "https://not-study-link.com?studyUID=test",
+            "https://share.study.link",  # No parameters
+            "https://share.study.link?invalid=params"
+        ]
+        
+        for invalid_url in invalid_urls:
+            print(f"Testing invalid URL: {invalid_url}")
+            urls = self.detect_study_share_urls(f"Check this: {invalid_url}")
+            if urls:
+                study_info = self.parse_study_share_url(urls[0])
+                if study_info:
+                    print(f"⚠️  Unexpectedly parsed invalid URL")
+                else:
+                    print(f"✅ Correctly rejected invalid URL")
+            else:
+                print(f"✅ Correctly ignored non-study URL")
+        
+        print(f"\n📊 *** STUDY URL TESTING COMPLETE ***")
 
     def is_self_message(self, from_jid):
         """Check if a message is from the bot itself to prevent infinite loops"""
@@ -666,6 +860,7 @@ class XMPPAutoReplyBot:
         print("  priority <number>     - Set presence priority")
         print("\nTesting Commands:")
         print("  test                  - Run security injection tests")
+        print("  teststudy             - Test study share URL parsing")
         print("\nGeneral Commands:")
         print("  help                  - Show this help")
         print("  quit                  - Stop the bot")
@@ -709,6 +904,10 @@ class XMPPAutoReplyBot:
             print("🧪 Starting security injection tests...")
             self.test_status_injection()
             
+        elif command == '/teststudy':
+            print("🏥 Testing study share URL parsing...")
+            self.test_study_url_parsing()
+            
         elif command == '/priority':
             if len(parts) < 2:
                 print("Usage: /priority <number>")
@@ -729,6 +928,7 @@ class XMPPAutoReplyBot:
             print("/show <state> [msg]  - Set show state (online/away/dnd/chat/xa)")
             print("/priority <number>   - Set presence priority")
             print("/test                - Run security injection tests")
+            print("/teststudy           - Test study share URL parsing")
             print("/help                - Show this help")
             print()
             
@@ -762,6 +962,13 @@ class XMPPAutoReplyBot:
                     self.process_user_command(message['body'])
                     self.message_queue.task_done()
                     continue
+                
+                # Check for study share URLs in the message
+                study_urls = self.detect_study_share_urls(message['body'])
+                for url in study_urls:
+                    study_info = self.parse_study_share_url(url)
+                    if study_info:
+                        self.process_study_share(message['from'], study_info)
                 
                 # Send receipt if requested (immediate)
                 if message['receipt_requested']:
