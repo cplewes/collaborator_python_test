@@ -337,7 +337,7 @@ class StudyMonitorPOC:
             
             # SASL Authentication
             rid = self.rid_manager.next_rid()
-            auth_str = f"\\x00{username}\\x00{self.access_token}"
+            auth_str = f"\x00{username}\x00{self.access_token}"
             auth_b64 = base64.b64encode(auth_str.encode()).decode()
             auth_body = f"""
             <body rid='{rid}' sid='{self.sid}' xmlns='http://jabber.org/protocol/httpbind'>
