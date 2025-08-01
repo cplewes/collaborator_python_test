@@ -362,6 +362,14 @@ class XMPPAutoReplyBot:
             # Parse query parameters
             params = urllib.parse.parse_qs(parsed.query)
             
+            # Validate that we have the required parameters
+            required_params = ['studyUID', 'patientId', 'issuer', 'procedure', 'id']
+            missing_params = [param for param in required_params if param not in params]
+            
+            if missing_params:
+                print(f"[DEBUG] Missing required parameters: {missing_params}")
+                return None
+            
             study_info = {}
             
             # Extract and decode studyUID (Base64)
