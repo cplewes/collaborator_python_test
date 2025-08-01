@@ -885,6 +885,21 @@ class StudyMonitorPOC:
         """Clario heartbeat worker thread - sends periodic keep-alives."""
         print("[DEBUG] Starting Clario heartbeat thread...")
         
+        # Wait for message processor thread to set up event loop
+        print("[DEBUG] Waiting for message processor event loop to be ready...")
+        loop_wait_count = 0
+        while self.running and (not self.clario_loop or self.clario_loop.is_closed()):
+            time.sleep(1)
+            loop_wait_count += 1
+            if loop_wait_count % 5 == 0:  # Log every 5 seconds
+                print(f"[DEBUG] Still waiting for event loop... ({loop_wait_count}s)")
+            if loop_wait_count > 30:  # Give up after 30 seconds
+                print("[DEBUG] Timeout waiting for event loop - heartbeat disabled")
+                return
+        
+        if self.clario_loop:
+            print("[DEBUG] Event loop ready - heartbeat enabled")
+        
         heartbeat_count = 0
         
         while self.running:
@@ -908,6 +923,7 @@ class StudyMonitorPOC:
                     print("[DEBUG] Heartbeat skipped - no Clario login_id")
                 else:
                     print("[DEBUG] Heartbeat skipped - event loop not available")
+                    break  # Exit if event loop becomes unavailable
                 
                 # Send heartbeat every 30 seconds
                 for i in range(30):
