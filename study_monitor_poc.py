@@ -42,226 +42,8 @@ KEYCLOAK_URL = f"https://abpei-hub-app-north.albertahealthservices.ca/auth/realm
 # Hardcoded Clario URL as requested
 CLARIO_BASE_URL = "https://worklist.mic.ca"
 
-# === Clario Integration (from clario_search_tool.py) ===
-
-class ClarionPasswordEncoder:
-    """Handle Clario's XOR password encoding."""
-    
-    XOR_KEY = "PasswordFieldKey"
-    
-    @classmethod
-    def encode_password(cls, password: str) -> str:
-        """Encode password using Clario's XOR + Base64 method."""
-        if not password:
-            raise ValueError("Password cannot be empty")
-        
-        key = cls.XOR_KEY
-        key_len = len(key)
-        xor_result = []
-        
-        for i, char in enumerate(password):
-            key_char = key[i % key_len]
-            xor_byte = ord(char) ^ ord(key_char)
-            xor_result.append(xor_byte)
-        
-        xor_bytes = bytes(xor_result)
-        encoded = base64.b64encode(xor_bytes).decode("ascii")
-        return encoded
-
-class ClarionClient:
-    """Simplified Clario client for patient lookups."""
-    
-    def __init__(self, username: str, password: str):
-        self.base_url = CLARIO_BASE_URL.rstrip("/")
-        self.username = username
-        self.password = password
-        self.encoded_password = ClarionPasswordEncoder.encode_password(password)
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.session_token: Optional[str] = None
-        self.transaction_id = 1000
-        
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Content-Type": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-    
-    async def connect(self) -> bool:
-        """Connect and authenticate to Clario."""
-        try:
-            print("[*] Connecting to Clario...")
-            
-            # Create session
-            connector = aiohttp.TCPConnector(limit=10, limit_per_host=5)
-            timeout = aiohttp.ClientTimeout(total=30)
-            self.session = aiohttp.ClientSession(
-                connector=connector, 
-                timeout=timeout, 
-                headers=self.headers
-            )
-            
-            # Update headers for Clario
-            self.session.headers.update({
-                "Origin": self.base_url,
-                "Referer": f"{self.base_url}/",
-            })
-            
-            # Bootstrap session
-            async with self.session.get("/") as response:
-                pass  # Just get initial cookies
-            
-            # Login
-            login_payload = {
-                "data": [
-                    "Login.access",
-                    [self.username, self.encoded_password, "", "0"]
-                ],
-                "tid": self.transaction_id,
-                "login": 0,
-                "app": "login",
-                "action": "rpc",
-                "method": "direct",
-            }
-            
-            async with self.session.post(
-                "/rpc/app.php?app=login&sysClient=", 
-                json=login_payload
-            ) as response:
-                if response.status != 200:
-                    print(f"❌ Clario login failed: HTTP {response.status}")
-                    return False
-                
-                response_data = await response.json()
-                
-                if isinstance(response_data, list) and len(response_data) > 0:
-                    result = response_data[0].get("result", {})
-                    
-                    if not result.get("success"):
-                        error_msg = result.get("msg", "Unknown login error")
-                        print(f"❌ Clario login failed: {error_msg}")
-                        return False
-                    
-                    login_id = int(result["loginID"])
-                    self.session_token = str(login_id)
-                    print(f"[+] Clario authentication successful (login_id={self.session_token})")
-                    
-                    # Session preparation
-                    self.transaction_id += 1
-                    prepare_payload = {
-                        "data": ["login/Prepare.user", [login_id, None]],
-                        "tid": self.transaction_id,
-                        "login": login_id,
-                        "app": "login",
-                        "action": "rpc",
-                        "method": "direct"
-                    }
-                    
-                    async with self.session.post(
-                        "/rpc/app.php?app=login&sysClient=", 
-                        json=prepare_payload
-                    ) as prep_response:
-                        pass  # Session preparation
-                    
-                    return True
-                
-                print("❌ Unexpected Clario login response format")
-                return False
-                
-        except Exception as e:
-            print(f"❌ Clario connection failed: {e}")
-            return False
-    
-    async def search_by_accession(self, accession: str) -> Optional[Dict[str, Any]]:
-        """Search for patient details by accession number."""
-        if not self.session_token:
-            print("❌ Not authenticated to Clario")
-            return None
-        
-        try:
-            print(f"[*] Searching Clario for accession: {accession}")
-            
-            search_descriptor = {
-                "params": {
-                    "input": {"ws2": accession},
-                    "type": "advanced",
-                    "isCountOnly": False,
-                    "limit": None,
-                },
-                "call": "search/Exam.search",
-                "sort": [{"property": "defaultDirectSorting", "direction": "DESC"}],
-                "operation": "user",
-                "page": 1,
-                "start": 0,
-                "limit": "50",
-            }
-            
-            self.transaction_id += 1
-            search_payload = {
-                "data": [search_descriptor],
-                "tid": self.transaction_id,
-                "login": int(self.session_token),
-                "app": "workflow",
-                "action": "rpc",
-                "method": "search",
-            }
-            
-            async with self.session.post(
-                "/rpc/app.php?app=workflow&sysClient=",
-                json=search_payload
-            ) as response:
-                if response.status != 200:
-                    print(f"❌ Clario search failed: HTTP {response.status}")
-                    return None
-                
-                response_data = await response.json()
-                
-                if isinstance(response_data, list) and len(response_data) > 0:
-                    result = response_data[0]
-                    
-                    if "result" in result:
-                        search_result = result["result"]
-                        
-                        if not search_result.get("success", False):
-                            error_msg = search_result.get("error", "Search failed")
-                            print(f"❌ Clario search failed: {error_msg}")
-                            return None
-                        
-                        data = search_result.get("data", [])
-                        print(f"[+] Found {len(data)} studies in Clario")
-                        
-                        if data:
-                            # Return the first study with extracted patient info
-                            study = data[0]
-                            return {
-                                "mrn": study.get("mrn", ""),
-                                "uli": study.get("externalMrn", ""),  # _external_mrn field
-                                "dob": study.get("dob", ""),  # Date of birth
-                                "gender": study.get("gender", ""),  # Patient gender
-                                "patient_name": study.get("name", ""),
-                                "exam_id": study.get("examID", ""),
-                                "raw_study": study  # Include full study data for debugging
-                            }
-                        else:
-                            print(f"❌ No studies found for accession {accession}")
-                            return None
-                    else:
-                        print("❌ Unexpected Clario search response")
-                        return None
-                
-                print("❌ Invalid Clario search response format")
-                return None
-                
-        except Exception as e:
-            print(f"❌ Clario search error: {e}")
-            return None
-    
-    async def close(self):
-        """Close the Clario session."""
-        if self.session and not self.session.closed:
-            await self.session.close()
+# === Clario Integration (import from clario_search_tool.py) ===
+from clario_search_tool import ClarionSearchTool
 
 # === XMPP Integration (from xmpp_auto_reply.py) ===
 
@@ -291,7 +73,7 @@ class StudyMonitorPOC:
         self.processor_thread = None
         
         # Clario components
-        self.clario_client = None
+        self.clario_tool = None
         self.clario_loop = None
         
         # Track processed messages
@@ -401,8 +183,14 @@ class StudyMonitorPOC:
     
     async def authenticate_clario(self, username: str, password: str) -> bool:
         """Authenticate with Clario."""
-        self.clario_client = ClarionClient(username, password)
-        return await self.clario_client.connect()
+        try:
+            self.clario_tool = ClarionSearchTool(CLARIO_BASE_URL, username, password)
+            await self.clario_tool.connect()
+            print("[+] Clario authentication successful")
+            return True
+        except Exception as e:
+            print(f"❌ Clario authentication failed: {e}")
+            return False
     
     def detect_study_share_urls(self, message_body: str) -> List[str]:
         """Detect study share URLs in message body."""
@@ -493,7 +281,26 @@ class StudyMonitorPOC:
             return
         
         # Look up patient details in Clario
-        patient_details = await self.clario_client.search_by_accession(accession)
+        try:
+            studies = await self.clario_tool.search_exam_by_accession(accession)
+            if studies:
+                # Get the first study and extract patient details
+                study = studies[0]
+                patient_details = {
+                    "mrn": getattr(study, '_mrn', ''),
+                    "uli": getattr(study, '_external_mrn', ''),  # _external_mrn field
+                    "dob": getattr(study, '_dob', ''),  # Date of birth
+                    "gender": getattr(study, '_gender', ''),  # Patient gender
+                    "patient_name": study.patient_name,
+                    "exam_id": study.exam_id,
+                }
+                print(f"[+] Found patient details in Clario: {patient_details}")
+            else:
+                print(f"❌ No studies found for accession {accession}")
+                patient_details = None
+        except Exception as e:
+            print(f"❌ Clario search error: {e}")
+            patient_details = None
         
         # Generate JSON output
         output = {
@@ -615,8 +422,8 @@ class StudyMonitorPOC:
                 print(f"❌ Message processor error: {e}")
         
         # Close Clario client
-        if self.clario_client:
-            self.clario_loop.run_until_complete(self.clario_client.close())
+        if self.clario_tool:
+            self.clario_loop.run_until_complete(self.clario_tool.close())
         
         self.clario_loop.close()
         print("[DEBUG] Message processor thread stopped")
