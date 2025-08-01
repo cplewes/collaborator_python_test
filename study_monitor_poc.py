@@ -585,7 +585,7 @@ class StudyMonitorPOC:
             return False
     
     async def _rpc_call(self, app: str, method: str, params: List, method_type: str = "direct"):
-        """Helper method for Clario RPC calls."""
+        """Helper method for Clario RPC calls with detailed logging."""
         if not self.clario_tool or not self.clario_tool.session:
             raise Exception("Clario not connected")
         
@@ -598,15 +598,36 @@ class StudyMonitorPOC:
             "method": method_type,
         }
         
-        rpc_url = f"/rpc/app.php?app={app}&sysClient="
-        status_code, response_data, headers = await self.clario_tool._make_request(
-            "POST", rpc_url, json=payload
-        )
+        # Debug logging for RPC requests
+        logger.debug("RPC Request: %s", json.dumps(payload, indent=2))
         
-        if isinstance(response_data, list) and len(response_data) > 0:
-            return response_data[0].get("result")
-        else:
-            raise Exception("Invalid RPC response format")
+        rpc_url = f"/rpc/app.php?app={app}&sysClient="
+        logger.debug("RPC URL: %s", rpc_url)
+        
+        try:
+            status_code, response_data, headers = await self.clario_tool._make_request(
+                "POST", rpc_url, json=payload
+            )
+            
+            logger.debug("RPC Response: status=%d, data=%s", status_code, 
+                        json.dumps(response_data, indent=2) if isinstance(response_data, (dict, list)) else str(response_data))
+            
+            if isinstance(response_data, list) and len(response_data) > 0:
+                result = response_data[0].get("result")
+                if result is None:
+                    # Check for error in response
+                    error = response_data[0].get("error")
+                    if error:
+                        raise Exception(f"RPC error: {error}")
+                    else:
+                        raise Exception(f"No result in RPC response: {response_data[0]}")
+                return result
+            else:
+                raise Exception(f"Invalid RPC response format: {type(response_data)} - {response_data}")
+                
+        except Exception as e:
+            logger.error("RPC call failed for %s.%s: %s", app, method, str(e))
+            raise
     
     async def heartbeat(self) -> bool:
         """Send keep-alive heartbeat to Clario."""
@@ -617,8 +638,9 @@ class StudyMonitorPOC:
         logger.debug("Sending heartbeat for login_id: %d", self.clario_login_id)
 
         try:
+            # Use correct method type and app based on working login code
             result = await self._rpc_call(
-                "home", "login/Access.userActive", [True, 50000, "home"], method_type="one"
+                "login", "login/Access.userActive", [True, 50000, "home"], method_type="direct"
             )
             logger.debug("Heartbeat successful (result=%s)", result)
             return True
