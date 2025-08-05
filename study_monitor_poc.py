@@ -33,6 +33,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List
 import urllib.parse
 import uuid
+import html
 
 # === Configuration ===
 BOSH_URL = "https://abpei-hub-app-north.albertahealthservices.ca:7443/http-bind/"
@@ -774,36 +775,34 @@ class StudyMonitorPOC:
             return False
         
         print(f"[DEBUG] Sending XMPP reply to: {to_jid}")
-        print(f"[DEBUG] Reply message: {message[:100]}{'...' if len(message) > 100 else ''}")
+        print(f"[DEBUG] Message length: {len(message)} chars")
+        print(f"[DEBUG] Reply message: {message[:150]}{'...' if len(message) > 150 else ''}")
+        
+        # XML escape the message content to handle URLs with special characters
+        escaped_message = html.escape(message)
+        print(f"[DEBUG] XML escaped message: {escaped_message[:150]}{'...' if len(escaped_message) > 150 else ''}")
         
         # Generate unique message ID
         message_id = str(uuid.uuid4())
         rid = self.rid_manager.next_rid()
         
         # Build message structure matching working BOSH requests
-        reply_body = f"""<body rid='{rid}' sid='{self.sid}' xmlns='http://jabber.org/protocol/httpbind'><message from='{self.jid}' id='{message_id}' to='{to_jid}' type='chat' xmlns='jabber:client'><body>{message}</body><active xmlns='http://jabber.org/protocol/chatstates'/><request xmlns='urn:xmpp:receipts'/><origin-id id='{message_id}' xmlns='urn:xmpp:sid:0'/></message></body>"""
+        reply_body = f"""<body rid='{rid}' sid='{self.sid}' xmlns='http://jabber.org/protocol/httpbind'><message from='{self.jid}' id='{message_id}' to='{to_jid}' type='chat' xmlns='jabber:client'><body>{escaped_message}</body><active xmlns='http://jabber.org/protocol/chatstates'/><request xmlns='urn:xmpp:receipts'/><origin-id id='{message_id}' xmlns='urn:xmpp:sid:0'/></message></body>"""
         
-        print(f"[DEBUG] XMPP reply XML: {reply_body[:200]}...")
-        
-        # Use the same headers as BOSH polling (including Authorization)
-        reply_headers = {
-            "Authorization": f"Bearer {self.access_token}",
-            "Content-Type": "text/xml; charset=UTF-8",
-            "Origin": "https://abpei-hub-app-north.albertahealthservices.ca",
-            "Referer": "https://abpei-hub-app-north.albertahealthservices.ca/",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        }
+        print(f"[DEBUG] XMPP reply XML length: {len(reply_body)} chars")
+        print(f"[DEBUG] XMPP reply XML: {reply_body[:300]}...")
         
         try:
-            resp = requests.post(BOSH_URL, data=reply_body, headers=reply_headers)
+            # Use self.session which already has Authorization header and session context
+            resp = self.session.post(BOSH_URL, data=reply_body)
             resp.raise_for_status()
             print(f"[+] XMPP reply sent successfully to {to_jid}")
-            print(f"[DEBUG] Reply response: {resp.status_code}, {resp.text[:100]}...")
+            print(f"[DEBUG] Reply response: {resp.status_code}, {resp.text[:200]}...")
             return True
         except Exception as e:
             print(f"❌ Failed to send XMPP reply: {e}")
             if hasattr(e, 'response') and e.response:
-                print(f"[DEBUG] Error response: {e.response.status_code}, {e.response.text[:200]}...")
+                print(f"[DEBUG] Error response: {e.response.status_code}, {e.response.text[:300]}...")
             return False
     
     def detect_study_share_urls(self, message_body: str) -> List[str]:
