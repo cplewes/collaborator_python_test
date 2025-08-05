@@ -703,6 +703,33 @@ class StudyMonitorPOC:
             logger.error("Failed to get patient info for patient_id=%s, exam_id=%s: %s", patient_id, exam_id, str(e))
             return {}
     
+    async def get_ordering_physician(self, exam_id: str) -> Dict[str, Any]:
+        """Get ordering physician details for an exam using Clario RPC."""
+        logger.debug("Fetching ordering physician for exam_id: %s", exam_id)
+        
+        if not self.clario_login_id:
+            raise Exception("Not logged in - no login_id")
+        
+        try:
+            # Use the RPC call from original clario_search_tool.py
+            result = await self._rpc_call(
+                "workflow", "workflow/patient/Exam.order", [exam_id], method_type="direct"
+            )
+            
+            logger.debug("Ordering physician RPC successful")
+            
+            # Return the full result for processing
+            if result:
+                logger.debug("Ordering physician data: %s", result)
+                return result
+            else:
+                logger.warning("No ordering physician data in response")
+                return {}
+                
+        except Exception as e:
+            logger.error("Failed to get ordering physician for exam_id=%s: %s", exam_id, str(e))
+            return {}
+    
     def xor_encrypt(self, text: str, key: str) -> str:
         """XOR encrypt text with key (port of JavaScript xorEncrypt function)."""
         result = ''
@@ -767,6 +794,42 @@ class StudyMonitorPOC:
         if '@' in jid:
             return jid.split('@')[0]
         return jid
+    
+    def extract_physician_name(self, ordering_physician_data: Dict[str, Any]) -> str:
+        """Extract physician name from ordering physician RPC response."""
+        if not ordering_physician_data:
+            return ""
+        
+        # Try common field names for physician information
+        # Based on the original clario_search_tool.py structure
+        physician_fields = [
+            'physician_name', 'doctor_name', 'ordering_physician', 
+            'name', 'fullName', 'physicianName', 'orderingPhysician'
+        ]
+        
+        for field in physician_fields:
+            if field in ordering_physician_data:
+                physician_name = str(ordering_physician_data[field]).strip()
+                if physician_name:
+                    print(f"[DEBUG] Found physician name in field '{field}': {physician_name}")
+                    return physician_name
+        
+        # If no standard field found, log the available fields for debugging
+        if ordering_physician_data:
+            available_fields = list(ordering_physician_data.keys())
+            print(f"[DEBUG] No physician name found. Available fields: {available_fields}")
+            
+            # Try to find any field that might contain a name (contains common name words)
+            name_indicators = ['name', 'doctor', 'physician', 'md', 'dr']
+            for field, value in ordering_physician_data.items():
+                field_lower = field.lower()
+                if any(indicator in field_lower for indicator in name_indicators):
+                    physician_name = str(value).strip()
+                    if physician_name:
+                        print(f"[DEBUG] Found potential physician name in field '{field}': {physician_name}")
+                        return physician_name
+        
+        return ""
     
     def send_xmpp_reply(self, to_jid: str, message: str) -> bool:
         """Send XMPP reply message to the specified JID."""
@@ -933,6 +996,9 @@ class StudyMonitorPOC:
                 # Get detailed patient demographics using the correct RPC call
                 patient_info = await self.get_patient_info(study.patient_id, study.exam_id)
                 
+                # Get ordering physician details
+                ordering_physician_info = await self.get_ordering_physician(study.exam_id)
+                
                 if patient_info:
                     patient_details = {
                         "mrn": patient_info.get("mrn", ""),
@@ -942,6 +1008,7 @@ class StudyMonitorPOC:
                         "patient_name": patient_info.get("name", study.patient_name),  # Prefer full name from patient info
                         "exam_id": study.exam_id,
                         "patient_id": study.patient_id,
+                        "ordering_physician": ordering_physician_info,  # Add ordering physician data
                     }
                     print(f"[+] Found complete patient details: {patient_details}")
                 else:
@@ -991,8 +1058,16 @@ class StudyMonitorPOC:
             # Extract username from sender JID
             username = self.extract_username_from_jid(from_jid)
             
-            # Use procedure as physician name (could be enhanced later)
-            physician = study_info.get('procedure', 'Unknown Procedure')
+            # Extract physician name from ordering physician data
+            ordering_physician = patient_details.get('ordering_physician', {})
+            physician = self.extract_physician_name(ordering_physician)
+            
+            if not physician:
+                # Fallback to procedure if no physician found
+                physician = study_info.get('procedure', 'Unknown Procedure')
+                print(f"[DEBUG] No ordering physician found, using procedure as fallback: {physician}")
+            else:
+                print(f"[DEBUG] Using ordering physician: {physician}")
             
             # Generate encrypted Google Forms link
             try:
