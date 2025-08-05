@@ -800,35 +800,18 @@ class StudyMonitorPOC:
         if not ordering_physician_data:
             return ""
         
-        # Try common field names for physician information
-        # Based on the original clario_search_tool.py structure
-        physician_fields = [
-            'physician_name', 'doctor_name', 'ordering_physician', 
-            'name', 'fullName', 'physicianName', 'orderingPhysician'
-        ]
+        # Extract from the known structure: result.values.ordering
+        values = ordering_physician_data.get("values", {})
+        if values:
+            print(f"[DEBUG] Processing ordering physician values: {list(values.keys())}")
         
-        for field in physician_fields:
-            if field in ordering_physician_data:
-                physician_name = str(ordering_physician_data[field]).strip()
-                if physician_name:
-                    print(f"[DEBUG] Found physician name in field '{field}': {physician_name}")
-                    return physician_name
+        ordering_physician = values.get("ordering", "")
         
-        # If no standard field found, log the available fields for debugging
-        if ordering_physician_data:
-            available_fields = list(ordering_physician_data.keys())
-            print(f"[DEBUG] No physician name found. Available fields: {available_fields}")
-            
-            # Try to find any field that might contain a name (contains common name words)
-            name_indicators = ['name', 'doctor', 'physician', 'md', 'dr']
-            for field, value in ordering_physician_data.items():
-                field_lower = field.lower()
-                if any(indicator in field_lower for indicator in name_indicators):
-                    physician_name = str(value).strip()
-                    if physician_name:
-                        print(f"[DEBUG] Found potential physician name in field '{field}': {physician_name}")
-                        return physician_name
+        if ordering_physician:
+            print(f"[DEBUG] Found ordering physician: {ordering_physician}")
+            return ordering_physician.strip()
         
+        print("[DEBUG] No ordering physician found in values.ordering")
         return ""
     
     def send_xmpp_reply(self, to_jid: str, message: str) -> bool:
@@ -1063,9 +1046,9 @@ class StudyMonitorPOC:
             physician = self.extract_physician_name(ordering_physician)
             
             if not physician:
-                # Fallback to procedure if no physician found
-                physician = study_info.get('procedure', 'Unknown Procedure')
-                print(f"[DEBUG] No ordering physician found, using procedure as fallback: {physician}")
+                # No fallback to procedure - use "Unknown Physician" as requested
+                physician = "Unknown Physician"
+                print(f"[DEBUG] No ordering physician found, using: {physician}")
             else:
                 print(f"[DEBUG] Using ordering physician: {physician}")
             
