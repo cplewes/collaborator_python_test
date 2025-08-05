@@ -32,6 +32,7 @@ import aiohttp
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 import urllib.parse
+import uuid
 
 # === Configuration ===
 BOSH_URL = "https://abpei-hub-app-north.albertahealthservices.ca:7443/http-bind/"
@@ -768,29 +769,41 @@ class StudyMonitorPOC:
     
     def send_xmpp_reply(self, to_jid: str, message: str) -> bool:
         """Send XMPP reply message to the specified JID."""
-        if not self.sid:
-            print("[DEBUG] Cannot send reply - no XMPP session")
+        if not self.sid or not self.jid:
+            print("[DEBUG] Cannot send reply - no XMPP session or JID")
             return False
         
         print(f"[DEBUG] Sending XMPP reply to: {to_jid}")
         print(f"[DEBUG] Reply message: {message[:100]}{'...' if len(message) > 100 else ''}")
         
+        # Generate unique message ID
+        message_id = str(uuid.uuid4())
         rid = self.rid_manager.next_rid()
-        reply_body = f"""
-        <body rid='{rid}' sid='{self.sid}' xmlns='http://jabber.org/protocol/httpbind'>
-          <message to='{to_jid}' type='chat' xmlns='jabber:client'>
-            <body>{message}</body>
-          </message>
-        </body>
-        """
+        
+        # Build message structure matching working BOSH requests
+        reply_body = f"""<body rid='{rid}' sid='{self.sid}' xmlns='http://jabber.org/protocol/httpbind'><message from='{self.jid}' id='{message_id}' to='{to_jid}' type='chat' xmlns='jabber:client'><body>{message}</body><active xmlns='http://jabber.org/protocol/chatstates'/><request xmlns='urn:xmpp:receipts'/><origin-id id='{message_id}' xmlns='urn:xmpp:sid:0'/></message></body>"""
+        
+        print(f"[DEBUG] XMPP reply XML: {reply_body[:200]}...")
+        
+        # Use the same headers as BOSH polling (including Authorization)
+        reply_headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "text/xml; charset=UTF-8",
+            "Origin": "https://abpei-hub-app-north.albertahealthservices.ca",
+            "Referer": "https://abpei-hub-app-north.albertahealthservices.ca/",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        }
         
         try:
-            resp = self.session.post(BOSH_URL, data=reply_body.strip())
+            resp = requests.post(BOSH_URL, data=reply_body, headers=reply_headers)
             resp.raise_for_status()
             print(f"[+] XMPP reply sent successfully to {to_jid}")
+            print(f"[DEBUG] Reply response: {resp.status_code}, {resp.text[:100]}...")
             return True
         except Exception as e:
             print(f"❌ Failed to send XMPP reply: {e}")
+            if hasattr(e, 'response') and e.response:
+                print(f"[DEBUG] Error response: {e.response.status_code}, {e.response.text[:200]}...")
             return False
     
     def detect_study_share_urls(self, message_body: str) -> List[str]:
