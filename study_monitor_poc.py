@@ -668,6 +668,34 @@ class StudyMonitorPOC:
             logger.error("Heartbeat failed: %s", str(e))
             return False
     
+    async def get_patient_info(self, patient_id: str, exam_id: str) -> Dict[str, Any]:
+        """Get detailed patient information using Clario RPC."""
+        logger.debug("Fetching patient info for patient_id: %s, exam_id: %s", patient_id, exam_id)
+        
+        if not self.clario_login_id:
+            raise Exception("Not logged in - no login_id")
+        
+        try:
+            # Use exact RPC format provided by user
+            result = await self._rpc_call(
+                "workflow", ">workflow/patient/Info.get", [patient_id, exam_id, False], method_type="one"
+            )
+            
+            logger.debug("Patient info RPC successful")
+            
+            # Parse patient information from result.information
+            if isinstance(result, dict) and "information" in result:
+                patient_info = result["information"]
+                logger.debug("Patient demographics: %s", patient_info)
+                return patient_info
+            else:
+                logger.warning("No information section in patient info response: %s", result)
+                return {}
+                
+        except Exception as e:
+            logger.error("Failed to get patient info for patient_id=%s, exam_id=%s: %s", patient_id, exam_id, str(e))
+            return {}
+    
     def detect_study_share_urls(self, message_body: str) -> List[str]:
         """Detect study share URLs in message body."""
         if not message_body:
@@ -789,17 +817,36 @@ class StudyMonitorPOC:
         try:
             studies = await self.clario_tool.search_exam_by_accession(accession)
             if studies:
-                # Get the first study and extract patient details
+                # Get the first study and extract basic info
                 study = studies[0]
-                patient_details = {
-                    "mrn": getattr(study, '_mrn', ''),
-                    "uli": getattr(study, '_external_mrn', ''),  # _external_mrn field
-                    "dob": getattr(study, '_dob', ''),  # Date of birth
-                    "gender": getattr(study, '_gender', ''),  # Patient gender
-                    "patient_name": study.patient_name,
-                    "exam_id": study.exam_id,
-                }
-                print(f"[+] Found patient details in Clario: {patient_details}")
+                print(f"[+] Found exam in Clario: exam_id={study.exam_id}, patient_id={study.patient_id}")
+                
+                # Get detailed patient demographics using the correct RPC call
+                patient_info = await self.get_patient_info(study.patient_id, study.exam_id)
+                
+                if patient_info:
+                    patient_details = {
+                        "mrn": patient_info.get("mrn", ""),
+                        "uli": getattr(study, '_external_mrn', ''),  # Still use external MRN from exam search
+                        "dob": patient_info.get("dob", ""),  # From patient info RPC
+                        "gender": patient_info.get("gender", ""),  # From patient info RPC
+                        "patient_name": patient_info.get("name", study.patient_name),  # Prefer full name from patient info
+                        "exam_id": study.exam_id,
+                        "patient_id": study.patient_id,
+                    }
+                    print(f"[+] Found complete patient details: {patient_details}")
+                else:
+                    # Fallback to basic study info if patient info RPC fails
+                    patient_details = {
+                        "mrn": getattr(study, '_mrn', ''),
+                        "uli": getattr(study, '_external_mrn', ''),
+                        "dob": "",  # Empty if we can't get patient info
+                        "gender": "",  # Empty if we can't get patient info
+                        "patient_name": study.patient_name,
+                        "exam_id": study.exam_id,
+                        "patient_id": study.patient_id,
+                    }
+                    print(f"[+] Found basic patient details (no demographics): {patient_details}")
             else:
                 print(f"❌ No studies found for accession {accession}")
                 patient_details = None
