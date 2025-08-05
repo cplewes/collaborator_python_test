@@ -426,10 +426,11 @@ class StudyMonitorPOC:
         self.processor_thread = None
         self.heartbeat_thread = None
         
-        # Clario components
+        # Clario components (will be created in message processor thread)
         self.clario_tool = None
         self.clario_loop = None
         self.clario_login_id = None
+        self.clario_credentials = None  # Store credentials for later authentication
         
         # Track processed messages
         self.processed_messages = set()
@@ -566,8 +567,20 @@ class StudyMonitorPOC:
         except Exception as e:
             print(f"❌ Failed to set presence: {e}")
     
-    async def authenticate_clario(self, username: str, password: str) -> bool:
-        """Authenticate with Clario."""
+    def set_clario_credentials(self, username: str, password: str):
+        """Store Clario credentials for later authentication in message processor thread."""
+        self.clario_credentials = (username, password)
+        print(f"[+] Clario credentials stored for user: {username}")
+    
+    async def authenticate_clario_in_thread(self) -> bool:
+        """Authenticate with Clario in the message processor thread's event loop."""
+        if not self.clario_credentials:
+            print("❌ No Clario credentials available")
+            return False
+            
+        username, password = self.clario_credentials
+        print(f"[*] Authenticating with Clario as: {username}")
+        
         try:
             self.clario_tool = ClarionSearchTool(CLARIO_BASE_URL, username, password)
             await self.clario_tool.connect()
@@ -980,6 +993,18 @@ class StudyMonitorPOC:
         # Create event loop for Clario async operations
         self.clario_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.clario_loop)
+        print("[DEBUG] Message processor event loop created")
+        
+        # Authenticate with Clario in this thread's event loop
+        if self.clario_credentials:
+            print("[DEBUG] Authenticating with Clario in message processor thread...")
+            auth_success = self.clario_loop.run_until_complete(self.authenticate_clario_in_thread())
+            if not auth_success:
+                print("❌ Failed to authenticate with Clario in message processor thread")
+                self.clario_loop.close()
+                return
+        else:
+            print("[DEBUG] No Clario credentials provided - Clario functionality disabled")
         
         while self.running:
             try:
@@ -1105,17 +1130,11 @@ def main():
         print("❌ XMPP authentication failed")
         return
     
-    # Authenticate Clario
-    clario_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(clario_loop)
+    # Store Clario credentials (authentication will happen in message processor thread)
+    monitor.set_clario_credentials(clario_username, clario_password)
     
-    if not clario_loop.run_until_complete(monitor.authenticate_clario(clario_username, clario_password)):
-        print("❌ Clario authentication failed")
-        return
-    
-    clario_loop.close()
-    
-    print("\\n✅ Both systems authenticated successfully!")
+    print("\\n✅ XMPP authenticated, Clario credentials stored!")
+    print("[*] Clario authentication will happen in message processor thread")
     
     # Start monitoring
     monitor.start_monitoring()
