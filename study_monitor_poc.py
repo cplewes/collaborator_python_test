@@ -31,6 +31,7 @@ import asyncio
 import aiohttp
 from datetime import datetime
 from typing import Optional, Dict, Any, List
+import urllib.parse
 
 # === Configuration ===
 BOSH_URL = "https://abpei-hub-app-north.albertahealthservices.ca:7443/http-bind/"
@@ -41,6 +42,10 @@ KEYCLOAK_URL = f"https://abpei-hub-app-north.albertahealthservices.ca/auth/realm
 
 # Hardcoded Clario URL as requested
 CLARIO_BASE_URL = "https://worklist.mic.ca"
+
+# Google Forms configuration
+XOR_KEY = "micphone"
+GOOGLE_FORM_BASE_URL = "https://docs.google.com/forms/d/e/1FAIpQLSe45evjTBqYBDJtcNLp221-QUp91a_KFgJJEZOFKIn4AxtF8g/viewform"
 
 # === Clario Integration (embedded from clario_search_tool.py) ===
 
@@ -696,6 +701,98 @@ class StudyMonitorPOC:
             logger.error("Failed to get patient info for patient_id=%s, exam_id=%s: %s", patient_id, exam_id, str(e))
             return {}
     
+    def xor_encrypt(self, text: str, key: str) -> str:
+        """XOR encrypt text with key (port of JavaScript xorEncrypt function)."""
+        result = ''
+        for i in range(len(text)):
+            xor_char = ord(text[i]) ^ ord(key[i % len(key)])
+            result += chr(xor_char)
+        return result
+    
+    def build_patient_json(self, name: str, uli: str, dob: str, gender: str, mrn: str) -> str:
+        """Build patient JSON string for Google Forms payload."""
+        patient_data = {
+            "name": name,
+            "ULI": uli,
+            "date_of_birth": dob,
+            "gender": gender,
+            "MRN": mrn
+        }
+        return json.dumps(patient_data)
+    
+    def build_google_form_url(self, encoded_payload: str, username: str, physician: str) -> str:
+        """Build Google Forms URL with encoded patient data."""
+        params = {
+            "usp": "pp_url",
+            "entry.420020934": physician,
+            "entry.1660492748": username, 
+            "entry.1126175213": encoded_payload
+        }
+        
+        query_string = urllib.parse.urlencode(params)
+        return f"{GOOGLE_FORM_BASE_URL}?{query_string}"
+    
+    def generate_google_forms_link(self, patient_details: Dict[str, Any], username: str, physician: str = "Unknown") -> str:
+        """Generate encrypted Google Forms link with patient data."""
+        print(f"[DEBUG] Generating Google Forms link for user: {username}, physician: {physician}")
+        
+        # Build patient JSON
+        json_str = self.build_patient_json(
+            patient_details.get("patient_name", ""),
+            patient_details.get("uli", ""),
+            patient_details.get("dob", ""),
+            patient_details.get("gender", ""),
+            patient_details.get("mrn", "")
+        )
+        print(f"[DEBUG] Patient JSON: {json_str}")
+        
+        # XOR encrypt with key
+        encrypted = self.xor_encrypt(json_str, XOR_KEY)
+        print(f"[DEBUG] Encrypted length: {len(encrypted)} bytes")
+        
+        # Base64 encode
+        encoded = base64.b64encode(encrypted.encode('latin1')).decode('ascii')
+        print(f"[DEBUG] Base64 encoded length: {len(encoded)} chars")
+        
+        # Build Google Forms URL
+        form_url = self.build_google_form_url(encoded, username, physician)
+        print(f"[DEBUG] Generated Google Forms URL: {form_url[:100]}...")
+        
+        return form_url
+    
+    def extract_username_from_jid(self, jid: str) -> str:
+        """Extract username from JID (e.g., 'kiranreddy' from 'kiranreddy@agfa.com/resource')."""
+        if '@' in jid:
+            return jid.split('@')[0]
+        return jid
+    
+    def send_xmpp_reply(self, to_jid: str, message: str) -> bool:
+        """Send XMPP reply message to the specified JID."""
+        if not self.sid:
+            print("[DEBUG] Cannot send reply - no XMPP session")
+            return False
+        
+        print(f"[DEBUG] Sending XMPP reply to: {to_jid}")
+        print(f"[DEBUG] Reply message: {message[:100]}{'...' if len(message) > 100 else ''}")
+        
+        rid = self.rid_manager.next_rid()
+        reply_body = f"""
+        <body rid='{rid}' sid='{self.sid}' xmlns='http://jabber.org/protocol/httpbind'>
+          <message to='{to_jid}' type='chat' xmlns='jabber:client'>
+            <body>{message}</body>
+          </message>
+        </body>
+        """
+        
+        try:
+            resp = self.session.post(BOSH_URL, data=reply_body.strip())
+            resp.raise_for_status()
+            print(f"[+] XMPP reply sent successfully to {to_jid}")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to send XMPP reply: {e}")
+            return False
+    
     def detect_study_share_urls(self, message_body: str) -> List[str]:
         """Detect study share URLs in message body."""
         if not message_body:
@@ -874,6 +971,34 @@ class StudyMonitorPOC:
         
         print("\\n📊 *** PATIENT LOOKUP RESULT ***")
         print(json.dumps(output, indent=2))
+        
+        # Generate Google Forms link and send reply if we have patient details
+        if patient_details:
+            print("\\n🔗 *** GENERATING GOOGLE FORMS LINK ***")
+            
+            # Extract username from sender JID
+            username = self.extract_username_from_jid(from_jid)
+            
+            # Use procedure as physician name (could be enhanced later)
+            physician = study_info.get('procedure', 'Unknown Procedure')
+            
+            # Generate encrypted Google Forms link
+            try:
+                forms_link = self.generate_google_forms_link(patient_details, username, physician)
+                
+                # Send XMPP reply with the Google Forms link
+                reply_message = f"Google Forms link for patient data: {forms_link}"
+                success = self.send_xmpp_reply(from_jid, reply_message)
+                
+                if success:
+                    print("\\n✅ *** GOOGLE FORMS LINK SENT SUCCESSFULLY ***")
+                else:
+                    print("\\n❌ *** FAILED TO SEND GOOGLE FORMS LINK ***")
+                    
+            except Exception as e:
+                print(f"\\n❌ *** GOOGLE FORMS LINK GENERATION FAILED: {e} ***")
+        else:
+            print("\\n⚠️  No patient details available - skipping Google Forms link generation")
     
     def poll_messages(self) -> List[Dict[str, Any]]:
         """Poll for incoming XMPP messages with comprehensive debugging."""
