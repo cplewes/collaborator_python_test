@@ -2,15 +2,22 @@
 """
 Study Monitor Proof-of-Concept
 
-This script combines XMPP message monitoring with Clario worklist integration.
-When a study share URL is detected in XMPP messages, it extracts the accession
-number and looks up detailed patient information from Clario.
+This script combines XMPP message monitoring with Clario worklist integration
+using modern async APIs. When a study share URL is detected in XMPP messages,
+it extracts the accession number and looks up detailed patient information from Clario.
 
 Features:
-- Threaded XMPP BOSH connection monitoring
-- Automatic study share URL detection
+- Async XMPP monitoring using ei_xmpp_api
+- Automatic study share URL detection and parsing
 - Async Clario integration for patient lookup
+- Google Forms link generation with encrypted patient data
 - JSON output of patient details (MRN, ULI, DOB, gender)
+
+Architecture:
+- Uses ei_xmpp_api for robust XMPP/BOSH communication
+- Uses clario_api with SearchBuilder for patient lookups
+- Pure async/await architecture throughout
+- Automatic connection management and heartbeat handling
 
 Usage:
     python3 study_monitor_poc.py
@@ -19,21 +26,14 @@ Usage:
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../clario_api'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../ei_xmpp_api'))
 
 import getpass
-import uuid
 import base64
-import requests
-import xml.etree.ElementTree as ET
-import time
-import threading
 import json
-import queue
-import re
 import urllib.parse
 import asyncio
-import aiohttp
-import html
+import signal
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
@@ -42,14 +42,25 @@ from clario_api import ClarioAPI, setup_logging, get_logger, SearchBuilder, Sear
 from clario_api.models import Study, SearchResult
 from clario_api.exceptions import ClarioAPIError, AuthenticationError, NotFoundError, ValidationError
 
-# === Configuration ===
-BOSH_URL = "https://abpei-hub-app-north.albertahealthservices.ca:7443/http-bind/"
-CLIENT_ID = "netboot"
-TARGET_IDP = "LDAP1"
-REALM = "EI"
-KEYCLOAK_URL = f"https://abpei-hub-app-north.albertahealthservices.ca/auth/realms/{REALM}/protocol/openid-connect/token?targetIdp={TARGET_IDP}"
+# Enterprise Imaging XMPP API imports
+from enterprise_imaging_chat import EnterpriseImagingChat
+from enterprise_imaging_chat.models import Message, User, Study as XMPPStudy
+from enterprise_imaging_chat.exceptions import (
+    EnterpriseImagingError,
+    AuthenticationError as XMPPAuthError,
+    ConnectionError as XMPPConnectionError,
+    MessageError
+)
+from enterprise_imaging_chat.utils import (
+    detect_study_share_urls,
+    extract_study_info
+)
 
-# Hardcoded Clario URL as requested
+# === Configuration ===
+# Enterprise Imaging XMPP server
+EI_SERVER_URL = "https://abpei-hub-app-north.albertahealthservices.ca"
+
+# Clario URL
 CLARIO_BASE_URL = "https://worklist.mic.ca"
 
 # Google Forms configuration
@@ -67,187 +78,30 @@ logger = setup_logging(
 
 # Note: ClarioSearchWrapper removed - now using ClarioAPI directly with async context manager
 
-
-# === XMPP Integration (from xmpp_auto_reply.py) ===
-
-class RIDManager:
-    def __init__(self):
-        self.rid = int(uuid.uuid4().int % 1e10)
-    
-    def next_rid(self):
-        self.rid += 1
-        return self.rid
+# Note: RIDManager removed - now using ei_xmpp_api for XMPP management
 
 class StudyMonitorPOC:
     """Integrated XMPP + Clario study monitoring system."""
     
     def __init__(self):
-        # XMPP components
-        self.session = requests.Session()
-        self.rid_manager = RIDManager()
-        self.sid = None
-        self.jid = None
-        self.access_token = None
+        # XMPP client using ei_xmpp_api
+        self.xmpp_client: Optional[EnterpriseImagingChat] = None
         self.running = False
         
-        # Threading infrastructure
-        self.message_queue = queue.Queue()
-        self.polling_thread = None
-        self.processor_thread = None
-        
-        # Clario components (will be created in message processor thread)
+        # Clario API client
         self.clario_api = None
-        self.clario_loop = None
         self.clario_credentials = None  # Store credentials for later authentication
         
         # Track processed messages
         self.processed_messages = set()
     
-    def authenticate_xmpp(self, username: str, password: str) -> bool:
-        """Authenticate with XMPP via Keycloak."""
-        print("[*] Authenticating XMPP with Keycloak...")
-        
-        try:
-            # Get access token
-            token_resp = self.session.post(KEYCLOAK_URL, data={
-                "grant_type": "password",
-                "client_id": CLIENT_ID,
-                "username": username,
-                "password": password,
-                "scope": "openid"
-            })
-            token_resp.raise_for_status()
-            self.access_token = token_resp.json()["access_token"]
-            print("[+] Got XMPP access token")
-            
-            # Set up headers
-            self.session.headers.update({
-                "Authorization": f"Bearer {self.access_token}",
-                "Content-Type": "text/xml; charset=UTF-8",
-                "Origin": "https://abpei-hub-app-north.albertahealthservices.ca",
-                "Referer": "https://abpei-hub-app-north.albertahealthservices.ca/",
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            })
-            
-            # Start BOSH session
-            rid = self.rid_manager.next_rid()
-            init_body = f"""
-            <body rid='{rid}' xmlns='http://jabber.org/protocol/httpbind' to='agfa.com' xml:lang='en' wait='60' hold='1' ver='1.6' xmpp:version='1.0' xmlns:xmpp='urn:xmpp:xbosh'/>
-            """
-            
-            resp = self.session.post(BOSH_URL, data=init_body.strip())
-            resp.raise_for_status()
-            tree = ET.fromstring(resp.text)
-            self.sid = tree.attrib["sid"]
-            print(f"[+] BOSH connected, sid: {self.sid}")
-            
-            # SASL Authentication
-            rid = self.rid_manager.next_rid()
-            auth_str = f"\x00{username}\x00{self.access_token}"
-            auth_b64 = base64.b64encode(auth_str.encode()).decode()
-            auth_body = f"""
-            <body rid='{rid}' sid='{self.sid}' xmlns='http://jabber.org/protocol/httpbind'>
-              <auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='PLAIN'>{auth_b64}</auth>
-            </body>
-            """
-            
-            auth_resp = self.session.post(BOSH_URL, data=auth_body.strip())
-            auth_resp.raise_for_status()
-            
-            if "<success" not in auth_resp.text:
-                raise AuthenticationError("SASL Authentication failed")
-            print("[+] SASL Authentication successful")
-            
-            # Restart stream
-            rid = self.rid_manager.next_rid()
-            restart_body = f"""
-            <body rid='{rid}' sid='{self.sid}' xmlns='http://jabber.org/protocol/httpbind' to='agfa.com' xml:lang='en' xmpp:restart='true' xmlns:xmpp='urn:xmpp:xbosh'/>
-            """
-            self.session.post(BOSH_URL, data=restart_body.strip())
-            
-            # Resource binding
-            rid = self.rid_manager.next_rid()
-            bind_body = f"""
-            <body rid='{rid}' sid='{self.sid}' xmlns='http://jabber.org/protocol/httpbind'>
-              <iq type='set' id='bind_1' xmlns='jabber:client'>
-                <bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>
-              </iq>
-            </body>
-            """
-            
-            bind_resp = self.session.post(BOSH_URL, data=bind_body.strip())
-            bind_resp.raise_for_status()
-            
-            bind_tree = ET.fromstring(bind_resp.text)
-            jid_element = bind_tree.find('.//{urn:ietf:params:xml:ns:xmpp-bind}jid')
-            
-            if jid_element is None:
-                raise ClarioAPIError("Resource binding failed")
-            
-            self.jid = jid_element.text
-            print(f"[+] Bound to JID: {self.jid}")
-            
-            # Start session
-            rid = self.rid_manager.next_rid()
-            session_body = f"""
-            <body rid='{rid}' sid='{self.sid}' xmlns='http://jabber.org/protocol/httpbind'>
-              <iq to='agfa.com' type='set' id='sess_1' xmlns='jabber:client'>
-                <session xmlns='urn:ietf:params:xml:ns:xmpp-session'/>
-              </iq>
-            </body>
-            """
-            self.session.post(BOSH_URL, data=session_body.strip())
-            print("[+] XMPP session established")
-            
-            # Set high priority presence to receive messages (fix for multi-client conflicts)
-            self.set_high_priority_presence()
-            
-            return True
-            
-        except Exception as e:
-            print(f"❌ XMPP authentication failed: {e}")
-            return False
+    # connect_xmpp method removed - now using ei_xmpp_api async context manager in main()
     
-    def set_high_priority_presence(self):
-        """Set high priority presence to win message routing vs other clients"""
-        if not self.sid:
-            return
-        
-        rid = self.rid_manager.next_rid()
-        # Set priority to +10 to beat most web clients (usually 0-5)
-        presence_body = f"""
-        <body rid='{rid}' sid='{self.sid}' xmlns='http://jabber.org/protocol/httpbind'>
-          <presence xmlns='jabber:client'>
-            <priority>10</priority>
-            <status>Study Monitor POC active</status>
-            <show>chat</show>
-          </presence>
-        </body>
-        """
-        
-        print("[DEBUG] Setting high priority presence to win message routing...")
-        try:
-            presence_resp = self.session.post(BOSH_URL, data=presence_body.strip())
-            presence_resp.raise_for_status()
-            print("[+] High priority presence set (priority: 10)")
-            print(f"[DEBUG] Our JID: {self.jid}")
-            print("[DEBUG] This should make us the preferred client for incoming messages")
-        except Exception as e:
-            print(f"❌ Failed to set presence: {e}")
+    # Note: set_high_priority_presence removed - now handled by ei_xmpp_api in connect_xmpp
     
-    def set_clario_credentials(self, username: str, password: str):
-        """Store Clario credentials for later authentication in message processor thread."""
-        self.clario_credentials = (username, password)
-        print(f"[+] Clario credentials stored for user: {username}")
-    
-    async def authenticate_clario_in_thread(self) -> bool:
-        """Authenticate with Clario in the message processor thread's event loop."""
-        if not self.clario_credentials:
-            print("❌ No Clario credentials available")
-            return False
-            
-        username, password = self.clario_credentials
-        print(f"[*] Authenticating with Clario as: {username}")
+    async def connect_clario(self, username: str, password: str) -> bool:
+        """Connect to Clario API."""
+        print(f"[*] Connecting to Clario as: {username}")
         
         try:
             self.clario_api = ClarioAPI(
@@ -262,7 +116,7 @@ class StudyMonitorPOC:
             user_info = await self.clario_api.login()
             
             # Authentication successful - heartbeat is now managed automatically by ClarioAPI
-            print(f"[+] Clario authentication successful (login_id={self.clario_api.login_id})")
+            print(f"[+] Clario connected successfully (login_id={self.clario_api.login_id})")
             
             return True
         except AuthenticationError as e:
@@ -277,6 +131,28 @@ class StudyMonitorPOC:
     
     
     # Note: Manual heartbeat method removed - ClarioAPI now manages heartbeat automatically
+    
+    async def handle_message(self, message: Message) -> None:
+        """Handle incoming XMPP messages - mostly for logging since ei_xmpp_api auto-detects study shares."""
+        print(f"\n📨 Message from {message.from_jid}: {message.body[:100]}{'...' if len(message.body) > 100 else ''}")
+        # ei_xmpp_api automatically detects study share URLs and calls study handlers
+        
+    async def handle_study_share(self, study: XMPPStudy) -> None:
+        """Handle detected study share using ei_xmpp_api Study model."""
+        print(f"\n🏥 *** STUDY SHARE DETECTED ***")
+        print(f"From: {study.shared_by}")
+        print(f"Study UID: {study.study_uid}")
+        print(f"Procedure: {study.procedure}")
+        
+        # Extract accession from procedure (last word)
+        accession = self.extract_accession_from_procedure(study.procedure)
+        
+        if not accession:
+            print("❌ Could not extract accession from procedure")
+            return
+        
+        # Process the study share using consolidated logic
+        await self.process_study_share_unified(study.shared_by, study.study_uid, study.procedure, study.share_url, accession)
     
     async def search_exam_by_accession(self, accession: str) -> List[Study]:
         """Search for exams by accession number using SearchBuilder."""
@@ -439,125 +315,34 @@ class StudyMonitorPOC:
         print("[DEBUG] No ordering physician found in values.ordering")
         return ""
     
-    def send_xmpp_reply(self, to_jid: str, message: str) -> bool:
-        """Send XMPP reply message to the specified JID."""
-        if not self.sid or not self.jid:
-            print("[DEBUG] Cannot send reply - no XMPP session or JID")
+    async def send_xmpp_reply(self, to_jid: str, message: str) -> bool:
+        """Send XMPP reply message using ei_xmpp_api client."""
+        if not self.xmpp_client or not self.xmpp_client.is_connected:
+            print("[DEBUG] Cannot send reply - no XMPP client or not connected")
             return False
         
         print(f"[DEBUG] Sending XMPP reply to: {to_jid}")
         print(f"[DEBUG] Message length: {len(message)} chars")
         print(f"[DEBUG] Reply message: {message[:150]}{'...' if len(message) > 150 else ''}")
         
-        # XML escape the message content to handle URLs with special characters
-        escaped_message = html.escape(message)
-        print(f"[DEBUG] XML escaped message: {escaped_message[:150]}{'...' if len(escaped_message) > 150 else ''}")
-        
-        # Generate unique message ID
-        message_id = str(uuid.uuid4())
-        rid = self.rid_manager.next_rid()
-        
-        # Build message structure matching working BOSH requests
-        reply_body = f"""<body rid='{rid}' sid='{self.sid}' xmlns='http://jabber.org/protocol/httpbind'><message from='{self.jid}' id='{message_id}' to='{to_jid}' type='chat' xmlns='jabber:client'><body>{escaped_message}</body><active xmlns='http://jabber.org/protocol/chatstates'/><request xmlns='urn:xmpp:receipts'/><origin-id id='{message_id}' xmlns='urn:xmpp:sid:0'/></message></body>"""
-        
-        print(f"[DEBUG] XMPP reply XML length: {len(reply_body)} chars")
-        print(f"[DEBUG] XMPP reply XML: {reply_body[:300]}...")
-        
         try:
-            # Use self.session which already has Authorization header and session context
-            resp = self.session.post(BOSH_URL, data=reply_body)
-            resp.raise_for_status()
-            print(f"[+] XMPP reply sent successfully to {to_jid}")
-            print(f"[DEBUG] Reply response: {resp.status_code}, {resp.text[:200]}...")
+            # Use ei_xmpp_api client to send message
+            message_id = await self.xmpp_client.send_message(
+                to=to_jid,
+                body=message,
+                request_receipt=True
+            )
+            
+            print(f"[+] XMPP reply sent successfully to {to_jid}, message_id: {message_id}")
             return True
+            
         except Exception as e:
             print(f"❌ Failed to send XMPP reply: {e}")
-            if hasattr(e, 'response') and e.response:
-                print(f"[DEBUG] Error response: {e.response.status_code}, {e.response.text[:300]}...")
             return False
     
-    def detect_study_share_urls(self, message_body: str) -> List[str]:
-        """Detect study share URLs in message body."""
-        if not message_body:
-            return []
-        
-        # Fixed regex pattern - use single backslashes for proper escaping
-        pattern = r'https://share\.study\.link[^\s]*'
-        urls = re.findall(pattern, message_body, re.IGNORECASE)
-        
-        if urls:
-            print(f"[DEBUG] Detected {len(urls)} study share URL(s): {urls}")
-        else:
-            print(f"[DEBUG] No study share URLs found in message: '{message_body[:100]}{'...' if len(message_body) > 100 else ''}'")
-        
-        return urls
+    # Removed manual URL detection - now using ei_xmpp_api's detect_study_share_urls utility
     
-    def parse_study_share_url(self, url: str) -> Optional[Dict[str, Any]]:
-        """Parse study share URL and extract metadata."""
-        print(f"[DEBUG] Parsing study share URL: {url}")
-        
-        try:
-            parsed = urllib.parse.urlparse(url)
-            print(f"[DEBUG] Parsed URL - netloc: {parsed.netloc}, query: {parsed.query}")
-            
-            if not parsed.netloc.lower() == 'share.study.link':
-                print(f"[DEBUG] Wrong netloc: expected 'share.study.link', got '{parsed.netloc}'")
-                return None
-            
-            params = urllib.parse.parse_qs(parsed.query)
-            print(f"[DEBUG] URL parameters: {list(params.keys())}")
-            
-            # Validate required parameters
-            required_params = ['studyUID', 'patientId', 'issuer', 'procedure', 'id']
-            missing_params = [param for param in required_params if param not in params]
-            
-            if missing_params:
-                print(f"[DEBUG] Missing required parameters: {missing_params}")
-                print(f"[DEBUG] Available parameters: {list(params.keys())}")
-                return None
-            
-            study_info = {}
-            
-            # Extract and decode parameters
-            if 'studyUID' in params:
-                try:
-                    study_uid_b64 = params['studyUID'][0]
-                    study_info['studyUID'] = base64.b64decode(study_uid_b64).decode('utf-8')
-                    print(f"[DEBUG] Decoded studyUID: {study_info['studyUID']}")
-                except Exception as e:
-                    print(f"[DEBUG] Failed to decode studyUID, using raw: {e}")
-                    study_info['studyUID'] = study_uid_b64
-            
-            if 'patientId' in params:
-                try:
-                    patient_id_b64 = params['patientId'][0]
-                    study_info['patientId'] = base64.b64decode(patient_id_b64).decode('utf-8')
-                    print(f"[DEBUG] Decoded patientId: {study_info['patientId']}")
-                except Exception as e:
-                    print(f"[DEBUG] Failed to decode patientId, using raw: {e}")
-                    study_info['patientId'] = patient_id_b64
-            
-            if 'procedure' in params:
-                raw_procedure = params['procedure'][0]
-                study_info['procedure'] = urllib.parse.unquote(raw_procedure)
-                print(f"[DEBUG] Decoded procedure: '{study_info['procedure']}'")
-            
-            # Add other fields
-            for field in ['issuer', 'id']:
-                if field in params:
-                    study_info[field] = urllib.parse.unquote(params[field][0])
-                    print(f"[DEBUG] Decoded {field}: {study_info[field]}")
-            
-            study_info['raw_url'] = url
-            print(f"[DEBUG] Successfully parsed study info: {study_info}")
-            return study_info
-            
-        except Exception as e:
-            print(f"❌ Failed to parse study share URL: {e}")
-            print(f"[DEBUG] URL that failed: {url}")
-            import traceback
-            print(f"[DEBUG] Full error: {traceback.format_exc()}")
-            return None
+    # Removed manual URL parsing - now using ei_xmpp_api's extract_study_info utility
     
     def extract_accession_from_procedure(self, procedure: str) -> Optional[str]:
         """Extract accession number (last word) from procedure string."""
@@ -578,20 +363,10 @@ class StudyMonitorPOC:
             print(f"[DEBUG] No words found in procedure string")
             return None
     
-    async def process_study_share(self, from_jid: str, study_info: Dict[str, Any]):
-        """Process a detected study share and lookup patient details."""
-        print(f"\\n🏥 *** STUDY SHARE DETECTED ***")
-        print(f"From: {from_jid}")
-        print(f"Study UID: {study_info.get('studyUID', 'N/A')}")
-        print(f"Procedure: {study_info.get('procedure', 'N/A')}")
-        
-        # Extract accession from procedure (last word)
-        procedure = study_info.get('procedure', '')
-        accession = self.extract_accession_from_procedure(procedure)
-        
-        if not accession:
-            print("❌ Could not extract accession from procedure")
-            return
+    async def process_study_share_unified(self, from_jid: str, study_uid: str, procedure: str, share_url: str, accession: str):
+        """Unified method to process study shares with patient lookup and Google Forms generation."""
+        print(f"\\n🔗 *** PROCESSING STUDY SHARE ***")
+        print(f"Accession: {accession}")
         
         # Look up patient details in Clario
         try:
@@ -650,8 +425,8 @@ class StudyMonitorPOC:
             },
             "source": {
                 "from_jid": from_jid,
-                "study_url": study_info.get('raw_url', ''),
-                "study_uid": study_info.get('studyUID', ''),
+                "study_url": share_url,
+                "study_uid": study_uid,
                 "procedure": procedure
             }
         }
@@ -683,7 +458,7 @@ class StudyMonitorPOC:
                 
                 # Send XMPP reply with the Google Forms link
                 reply_message = f"Google Forms link for patient data: {forms_link}"
-                success = self.send_xmpp_reply(from_jid, reply_message)
+                success = await self.send_xmpp_reply(from_jid, reply_message)
                 
                 if success:
                     print("\\n✅ *** GOOGLE FORMS LINK SENT SUCCESSFULLY ***")
@@ -695,220 +470,53 @@ class StudyMonitorPOC:
         else:
             print("\\n⚠️  No patient details available - skipping Google Forms link generation")
     
-    def poll_messages(self) -> List[Dict[str, Any]]:
-        """Poll for incoming XMPP messages with comprehensive debugging."""
-        if not self.sid:
-            print("[DEBUG] Cannot poll - no session ID")
-            return []
-        
-        rid = self.rid_manager.next_rid()
-        poll_body = f"""<body rid='{rid}' sid='{self.sid}' xmlns='http://jabber.org/protocol/httpbind' wait='60' hold='1'/>"""
-        
-        poll_start = time.time()
-        print(f"[DEBUG] BOSH Poll Request (RID: {rid}): Starting long-poll to {BOSH_URL}")
-        
-        try:
-            resp = self.session.post(BOSH_URL, data=poll_body.strip(), timeout=65)
-            poll_duration = time.time() - poll_start
-            resp.raise_for_status()
-            
-            print(f"[DEBUG] BOSH Poll Response: Status={resp.status_code}, Duration={poll_duration:.2f}s, Size={len(resp.text)} bytes")
-            
-            # Debug the raw response periodically
-            if int(time.time()) % 30 == 0:  # Every 30 seconds
-                print(f"[DEBUG] Raw BOSH Response: {resp.text[:200]}{'...' if len(resp.text) > 200 else ''}")
-            
-            messages = []
-            root = ET.fromstring(resp.text)
-            
-            # Check for ack attribute in response
-            ack_value = root.get('ack')
-            if ack_value:
-                print(f"[DEBUG] Server ACK: {ack_value}")
-            
-            # Count total elements for debugging
-            total_elements = len(list(root.iter()))
-            message_elements = 0
-            
-            for message in root.iter():
-                if message.tag.endswith('message') and message.get('type') == 'chat':
-                    message_elements += 1
-                    from_jid = message.get('from', '')
-                    to_jid = message.get('to', '')
-                    msg_id = message.get('id', '')
-                    
-                    body_text = ''
-                    for elem in message.iter():
-                        if elem.tag.endswith('body'):
-                            body_text = elem.text or ''
-                            break
-                    
-                    print(f"[DEBUG] Message Element: From={from_jid}, To={to_jid}, ID={msg_id}")
-                    print(f"[DEBUG] Message Body Preview: '{body_text[:50]}{'...' if len(body_text) > 50 else ''}'")
-                    
-                    if body_text and from_jid:
-                        if msg_id not in self.processed_messages:
-                            message_data = {
-                                'from': from_jid,
-                                'to': to_jid,
-                                'body': body_text,
-                                'id': msg_id or f"auto_{int(time.time() * 1000)}",
-                                'timestamp': datetime.now()
-                            }
-                            messages.append(message_data)
-                            self.processed_messages.add(msg_id)
-                            print(f"[DEBUG] Added message to queue: {msg_id}")
-                        else:
-                            print(f"[DEBUG] Skipped duplicate message: {msg_id}")
-            
-            print(f"[DEBUG] BOSH Parse Summary: {total_elements} total elements, {message_elements} message elements, {len(messages)} new messages")
-            
-            if len(messages) == 0:
-                print("[DEBUG] Empty poll response - waiting for next cycle")
-            
-            return messages
-            
-        except requests.exceptions.Timeout:
-            poll_duration = time.time() - poll_start
-            print(f"[DEBUG] BOSH poll timeout after {poll_duration:.2f}s (normal for long-polling)")
-            return []
-        except Exception as e:
-            poll_duration = time.time() - poll_start  
-            print(f"❌ Polling error after {poll_duration:.2f}s: {e}")
-            print(f"[DEBUG] Error type: {type(e).__name__}")
-            return []
+    # Legacy BOSH polling code removed - replaced with ei_xmpp_api async monitoring
     
-    def polling_worker(self):
-        """XMPP polling worker thread."""
-        print("[DEBUG] Starting XMPP polling thread...")
-        
-        while self.running:
-            try:
-                messages = self.poll_messages()
-                for message in messages:
-                    self.message_queue.put(message)
-                
-                if not messages:
-                    time.sleep(0.1)
-                    
-            except Exception as e:
-                print(f"❌ Polling worker error: {e}")
-                time.sleep(5)
-        
-        print("[DEBUG] XMPP polling thread stopped")
+    # Old polling worker removed - replaced with ei_xmpp_api async message monitoring
     
-    # Note: heartbeat_worker method removed - ClarioAPI now handles heartbeat automatically
-    def message_processor(self):
-        """Message processing worker thread."""
-        logger.debug("Starting message processor thread...")
-        
-        # Create event loop for Clario async operations
-        self.clario_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.clario_loop)
-        logger.debug("Message processor event loop created")
-        
-        # Authenticate with Clario in this thread's event loop
-        if self.clario_credentials:
-            logger.debug("Authenticating with Clario in message processor thread...")
-            auth_success = self.clario_loop.run_until_complete(self.authenticate_clario_in_thread())
-            if not auth_success:
-                logger.error("Failed to authenticate with Clario in message processor thread")
-                self.clario_loop.close()
-                return
-        else:
-            logger.debug("No Clario credentials provided - Clario functionality disabled")
-        
-        while self.running:
-            try:
-                try:
-                    message = self.message_queue.get(timeout=1.0)
-                except queue.Empty:
-                    continue
-                
-                print(f"\\n📨 *** MESSAGE RECEIVED ***")
-                print(f"From: {message['from']}")
-                print(f"Body: {message['body']}")
-                
-                # Check for study share URLs
-                study_urls = self.detect_study_share_urls(message['body'])
-                if study_urls:
-                    print(f"[DEBUG] Processing {len(study_urls)} study share URL(s)")
-                    for url in study_urls:
-                        print(f"[DEBUG] Processing URL: {url}")
-                        study_info = self.parse_study_share_url(url)
-                        if study_info:
-                            print(f"[DEBUG] URL parsed successfully, processing study share")
-                            # Process study share asynchronously
-                            self.clario_loop.run_until_complete(
-                                self.process_study_share(message['from'], study_info)
-                            )
-                        else:
-                            print(f"[DEBUG] Failed to parse URL: {url}")
-                else:
-                    print(f"[DEBUG] No study share URLs detected in message")
-                
-                self.message_queue.task_done()
-                
-            except Exception as e:
-                print(f"❌ Message processor error: {e}")
-        
-        # Close Clario client
-        if self.clario_api:
-            self.clario_loop.run_until_complete(self.clario_api.close())
-        
-        self.clario_loop.close()
-        logger.debug("Message processor thread stopped")
+    # Old message processor thread removed - replaced with ei_xmpp_api async handlers
     
-    def start_monitoring(self):
-        """Start the monitoring system."""
+    async def run_monitor(self, poll_interval: float = 2.0):
+        """Run the async monitoring system using ei_xmpp_api."""
         print("\\n🚀 *** STARTING STUDY MONITORING ***")
         print("Monitoring XMPP messages for study shares...")
         print("Will automatically lookup patient details in Clario")
         print("Press Ctrl+C to stop")
         
+        # Set up signal handlers for graceful shutdown
+        def signal_handler(signum, frame):
+            print(f"\\n🛑 Received signal {signum}, shutting down gracefully...")
+            self.running = False
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        # Register message and study handlers
+        self.xmpp_client.add_message_handler(self.handle_message)
+        self.xmpp_client.add_study_handler(self.handle_study_share)
+        
+        # Start monitoring
+        await self.xmpp_client.start_monitoring(poll_interval=poll_interval)
         self.running = True
         
+        print("[DEBUG] ei_xmpp_api monitoring started")
+        
+        # Keep running until signal received
         try:
-            # Start threads
-            self.polling_thread = threading.Thread(target=self.polling_worker, daemon=True)
-            self.polling_thread.start()
-            print("[DEBUG] XMPP polling thread started")
-            
-            self.processor_thread = threading.Thread(target=self.message_processor, daemon=True)
-            self.processor_thread.start()
-            print("[DEBUG] Message processor thread started")
-            
-            # Note: Heartbeat is now managed automatically by ClarioAPI
-            
-            # Main loop with thread monitoring
             while self.running:
-                time.sleep(5)  # Check every 5 seconds
-                
-                # Monitor thread health
-                if not self.polling_thread.is_alive():
-                    print("❌ XMPP polling thread died!")
-                if not self.processor_thread.is_alive():
-                    print("❌ Message processor thread died!")
-                
+                await asyncio.sleep(1)
         except KeyboardInterrupt:
-            print("\\n[*] Stopping study monitoring...")
             self.running = False
-            
-            # Wait for threads
-            if self.polling_thread and self.polling_thread.is_alive():
-                print("[DEBUG] Waiting for XMPP polling thread...")
-                self.polling_thread.join(timeout=5)
-            
-            if self.processor_thread and self.processor_thread.is_alive():
-                print("[DEBUG] Waiting for message processor thread...")
-                self.processor_thread.join(timeout=5)
-            
-            print("[DEBUG] All threads stopped")
+        
+        # Cleanup
+        print("\\n[*] Stopping study monitoring...")
+        await self.xmpp_client.stop_monitoring()
+        print("[DEBUG] Monitoring stopped")
 
 # === Main Application ===
 
-def main():
-    """Main application entry point."""
+async def main():
+    """Main application entry point using async context managers."""
     print("=== Study Monitor Proof-of-Concept ===")
     print("Integrates XMPP monitoring with Clario patient lookup")
     
@@ -922,22 +530,53 @@ def main():
     clario_username = input("Clario Username: ")
     clario_password = getpass.getpass("Clario Password: ")
     
+    # Configuration
+    server_url = EI_SERVER_URL
+    poll_interval = float(os.getenv("EI_POLL_INTERVAL", "2.0"))
+    
     # Create monitor
     monitor = StudyMonitorPOC()
     
-    # Authenticate XMPP
-    if not monitor.authenticate_xmpp(xmpp_username, xmpp_password):
-        print("❌ XMPP authentication failed")
-        return
-    
-    # Store Clario credentials (authentication will happen in message processor thread)
-    monitor.set_clario_credentials(clario_username, clario_password)
-    
-    print("\\n✅ XMPP authenticated, Clario credentials stored!")
-    print("[*] Clario authentication will happen in message processor thread")
-    
-    # Start monitoring
-    monitor.start_monitoring()
+    try:
+        # Use ei_xmpp_api async context manager pattern
+        monitor.xmpp_client = EnterpriseImagingChat(
+            server_url=server_url,
+            username=xmpp_username,
+            password=xmpp_password,
+            log_level="INFO"
+        )
+        
+        async with monitor.xmpp_client:
+            print(f"[+] Connected to XMPP as {monitor.xmpp_client.bound_jid}")
+            
+            # Set high priority presence
+            await monitor.xmpp_client.set_presence(
+                status="Study Monitor POC active",
+                show="online",
+                priority=10
+            )
+            print("[+] High priority presence set")
+            
+            # Connect to Clario
+            if not await monitor.connect_clario(clario_username, clario_password):
+                print("❌ Clario authentication failed")
+                return
+                
+            print("\\n✅ All connections established!")
+            
+            # Start async monitoring
+            await monitor.run_monitor(poll_interval=poll_interval)
+            
+    except (XMPPAuthError, XMPPConnectionError) as e:
+        print(f"❌ XMPP connection failed: {e}")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        raise
+    finally:
+        # Cleanup Clario (XMPP cleaned up by context manager)
+        if monitor.clario_api:
+            await monitor.clario_api.close()
+            print("✅ Clario disconnected")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
