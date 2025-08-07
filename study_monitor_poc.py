@@ -16,6 +16,10 @@ Usage:
     python3 study_monitor_poc.py
 """
 
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../clario_api'))
+
 import getpass
 import uuid
 import base64
@@ -29,11 +33,14 @@ import re
 import urllib.parse
 import asyncio
 import aiohttp
+import html
 from datetime import datetime
 from typing import Optional, Dict, Any, List
-import urllib.parse
-import uuid
-import html
+
+# Clario API imports
+from clario_api import ClarioAPI, setup_logging, get_logger, SearchBuilder, SearchTemplates
+from clario_api.models import Study, SearchResult
+from clario_api.exceptions import ClarioAPIError, AuthenticationError, NotFoundError, ValidationError
 
 # === Configuration ===
 BOSH_URL = "https://abpei-hub-app-north.albertahealthservices.ca:7443/http-bind/"
@@ -49,361 +56,17 @@ CLARIO_BASE_URL = "https://worklist.mic.ca"
 XOR_KEY = "micphone"
 GOOGLE_FORM_BASE_URL = "https://docs.google.com/forms/d/e/1FAIpQLSe45evjTBqYBDJtcNLp221-QUp91a_KFgJJEZOFKIn4AxtF8g/viewform"
 
-# === Clario Integration (embedded from clario_search_tool.py) ===
+# === Clario API Integration ===
 
-import logging
-from dataclasses import dataclass
-from typing import Union, Tuple
+# Set up clario_api logging system
+logger = setup_logging(
+    level="INFO",
+    context={'component': 'study_monitor_poc'},
+    mask_sensitive=True
+)
 
-# Set up basic logging for Clario
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Note: ClarioSearchWrapper removed - now using ClarioAPI directly with async context manager
 
-@dataclass
-class Study:
-    """Study data model."""
-    exam_id: str
-    patient_name: str
-    patient_id: str
-    accession: str
-    exam_date: str
-    exam_time: str
-    modality: str
-    priority: str
-    status: str
-    description: str
-    
-    @classmethod
-    def from_clario_data_with_extras(cls, data: Dict[str, Any]) -> 'Study':
-        """Create Study with extra fields stored."""
-        study = cls(
-            exam_id=str(data.get('examID', '')),
-            patient_name=data.get('name', ''),
-            patient_id=str(data.get('patientID', '')),
-            accession=data.get('accession', ''),
-            exam_date=data.get('time', '').split(' ')[0] if data.get('time') else '',
-            exam_time=data.get('time', '').split(' ', 1)[1] if data.get('time') and ' ' in data.get('time', '') else '',
-            modality=data.get('group', '').strip(),
-            priority=data.get('priority', ''),
-            status=data.get('status', ''),
-            description=data.get('procedureName', data.get('siteProcedure', ''))
-        )
-        
-        # Store additional useful fields
-        study._mrn = data.get('mrn', '')
-        study._external_mrn = data.get('externalMrn', '')
-        study._dob = data.get('dob', '')
-        study._gender = data.get('gender', '')
-        study._age = data.get('age', '')
-        study._site = data.get('site', '')
-        study._assigned_to = data.get('assign', '')
-        
-        return study
-
-class ClarionPasswordEncoder:
-    """Handle Clario's XOR password encoding."""
-    
-    XOR_KEY = "PasswordFieldKey"
-    
-    @classmethod
-    def encode_password(cls, password: str) -> str:
-        """Encode password using Clario's XOR + Base64 method."""
-        if not password:
-            raise ValueError("Password cannot be empty")
-        
-        key = cls.XOR_KEY
-        key_len = len(key)
-        xor_result = []
-        
-        for i, char in enumerate(password):
-            key_char = key[i % key_len]
-            xor_byte = ord(char) ^ ord(key_char)
-            xor_result.append(xor_byte)
-        
-        xor_bytes = bytes(xor_result)
-        encoded = base64.b64encode(xor_bytes).decode("ascii")
-        return encoded
-
-class ClarionSearchTool:
-    """Clario search tool for exam lookup."""
-    
-    def __init__(self, base_url: str, username: str, password: str):
-        """Initialize the Clario search tool."""
-        self.base_url = base_url.rstrip("/")
-        self.username = username
-        self.password = password
-        self.encoded_password = ClarionPasswordEncoder.encode_password(password)
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.session_token: Optional[str] = None
-        self.transaction_id = 1000
-        
-        # Headers for Clario API
-        self.headers = {
-            "User-Agent": "Clario-Search-Tool/1.0",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "Accept-Encoding": "gzip, deflate"
-        }
-    
-    async def connect(self) -> None:
-        """Create HTTP session and login to Clario."""
-        logger.info("Connecting to Clario server: %s", self.base_url)
-        
-        # Create session with connection pooling
-        connector = aiohttp.TCPConnector(
-            limit=10,
-            limit_per_host=5,
-            ttl_dns_cache=300,
-            enable_cleanup_closed=True,
-        )
-        
-        timeout = aiohttp.ClientTimeout(total=30)
-        self.session = aiohttp.ClientSession(
-            connector=connector, 
-            timeout=timeout, 
-            headers=self.headers
-        )
-        
-        # Bootstrap session first (get initial cookies)
-        await self.bootstrap()
-        
-        # Login to Clario
-        await self.login()
-    
-    async def bootstrap(self) -> bool:
-        """Get initial session cookies."""
-        logger.info("Bootstrapping session...")
-        try:
-            status_code, response_data, headers = await self._make_request("GET", "/")
-            logger.info("Session initialized successfully")
-            return True
-        except Exception as e:
-            logger.warning("Bootstrap warning: %s", str(e))
-            return False
-    
-    async def close(self) -> None:
-        """Close HTTP session."""
-        if self.session and not self.session.closed:
-            await self.session.close()
-            logger.info("Session closed")
-    
-    def _get_next_transaction_id(self) -> int:
-        """Get next transaction ID for RPC calls."""
-        self.transaction_id += 1
-        return self.transaction_id
-    
-    async def _make_request(self, method: str, endpoint: str, **kwargs) -> Tuple[int, Union[Dict, str], Dict[str, str]]:
-        """Make HTTP request with error handling."""
-        url = f"{self.base_url}{endpoint}"
-        
-        logger.debug("Making %s request to: %s", method, url)
-        
-        try:
-            async with self.session.request(method, url, **kwargs) as response:
-                status_code = response.status
-                response_headers = dict(response.headers)
-                
-                # Get response text
-                response_text = await response.text()
-                
-                logger.debug("Response: status=%d, size=%d bytes", status_code, len(response_text))
-                
-                if status_code >= 400:
-                    raise Exception(f"HTTP {status_code}: {response_text[:200]}")
-                
-                # Try to parse as JSON
-                if response_text.strip().startswith(('{', '[')):
-                    try:
-                        response_data = json.loads(response_text)
-                    except json.JSONDecodeError:
-                        response_data = response_text
-                else:
-                    response_data = response_text
-                
-                return status_code, response_data, response_headers
-                
-        except aiohttp.ClientError as e:
-            raise Exception(f"Request failed: {e}")
-        except asyncio.TimeoutError:
-            raise Exception("Request timed out")
-    
-    async def login(self) -> None:
-        """Login to Clario using RPC method."""
-        logger.info("Logging in to Clario as user: %s", self.username)
-        
-        # Update headers to match Clario requirements
-        clario_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Content-Type": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-            "Origin": self.base_url,
-            "Referer": f"{self.base_url}/",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Ch-Ua": '"Chromium";v="136", "Microsoft Edge";v="136", "Not.A/Brand";v="99"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Windows"',
-            "dev": "1",
-            "last": "0.692",
-            "opt": "log",
-        }
-        
-        # Update session headers
-        self.session.headers.update(clario_headers)
-        
-        # Prepare RPC login payload
-        login_payload = {
-            "data": [
-                "Login.access",
-                [self.username, self.encoded_password, "", "0"]
-            ],
-            "tid": self.transaction_id,
-            "login": 0,
-            "app": "login",
-            "action": "rpc",
-            "method": "direct",
-        }
-        
-        # Make RPC login request
-        rpc_url = f"/rpc/app.php?app=login&sysClient="
-        status_code, response_data, headers = await self._make_request(
-            "POST", 
-            rpc_url, 
-            json=login_payload
-        )
-        
-        logger.info("Login response received: status=%d", status_code)
-        logger.debug("Login response data: %s", response_data)
-        
-        # Parse RPC response
-        if isinstance(response_data, list) and len(response_data) > 0:
-            result = response_data[0].get("result", {})
-            
-            if not result.get("success"):
-                error_msg = result.get("msg", "Unknown login error")
-                raise Exception(f"Login failed: {error_msg}")
-            
-            # Store login ID for subsequent requests
-            login_id = int(result["loginID"])
-            self.session_token = str(login_id)
-            logger.info("Successfully logged in to Clario (login_id=%s)", self.session_token)
-            
-            # Step 2: Prepare user session
-            logger.debug("Starting session preparation for login_id: %d", login_id)
-            
-            prepare_payload = {
-                "data": [
-                    "login/Prepare.user",
-                    [login_id, None]
-                ],
-                "tid": self._get_next_transaction_id(),
-                "login": login_id,
-                "app": "login",
-                "action": "rpc",
-                "method": "direct"
-            }
-            
-            prepare_url = f"/rpc/app.php?app=login&sysClient="
-            status_code, prepare_response, headers = await self._make_request(
-                "POST",
-                prepare_url,
-                json=prepare_payload
-            )
-            
-            logger.debug("Session preparation response: status=%d", status_code)
-            
-        else:
-            raise Exception(f"Unexpected login response format: {type(response_data)}")
-    
-    async def search_exam_by_accession(self, accession: str) -> List[Study]:
-        """Search for exams by accession number using Clario RPC."""
-        logger.info("Searching for exam with accession: %s", accession)
-        
-        if not self.session_token:
-            raise Exception("Not logged in - no session token")
-        
-        # Build search descriptor
-        search_descriptor = {
-            "params": {
-                "input": {
-                    "ws2": accession
-                },
-                "type": "advanced",
-                "isCountOnly": False,
-                "limit": None,
-            },
-            "call": "search/Exam.search",
-            "sort": [{"property": "defaultDirectSorting", "direction": "DESC"}],
-            "operation": "user",
-            "page": 1,
-            "start": 0,
-            "limit": "50",
-        }
-        
-        # Prepare RPC search payload
-        search_payload = {
-            "data": [search_descriptor],
-            "tid": self._get_next_transaction_id(),
-            "login": int(self.session_token),
-            "app": "workflow",
-            "action": "rpc",
-            "method": "search",
-        }
-        
-        # Make RPC search request
-        rpc_url = f"/rpc/app.php?app=workflow&sysClient="
-        status_code, response_data, headers = await self._make_request(
-            "POST",
-            rpc_url,
-            json=search_payload
-        )
-        
-        logger.info("Search response received: status=%d", status_code)
-        
-        studies = []
-        
-        # Parse RPC response
-        if isinstance(response_data, list) and len(response_data) > 0:
-            result = response_data[0]
-            
-            if "result" in result:
-                search_result = result["result"]
-                
-                if not search_result.get("success", False):
-                    error_msg = search_result.get("error", "Search failed")
-                    logger.warning("Search failed: %s", error_msg)
-                    return studies
-                
-                # Parse studies from data
-                data = search_result.get("data", [])
-                logger.debug("Found %d study records in search response", len(data))
-                
-                for exam_data in data:
-                    try:
-                        study = Study.from_clario_data_with_extras(exam_data)
-                        studies.append(study)
-                        logger.debug("Parsed study: exam_id=%s, patient=%s, accession=%s", 
-                                   study.exam_id, study.patient_name, study.accession)
-                    except Exception as e:
-                        logger.warning("Failed to parse exam data: %s", e)
-                        
-            elif "error" in result:
-                error_msg = result["error"]
-                logger.error("Search RPC error: %s", error_msg)
-                raise Exception(f"Search failed: {error_msg}")
-            else:
-                logger.error("Unexpected search response format")
-                raise Exception("Unexpected search response format")
-        else:
-            logger.error("Invalid search response structure")
-            raise Exception("Invalid search response structure")
-        
-        logger.info("Found %d studies for accession %s", len(studies), accession)
-        return studies
 
 # === XMPP Integration (from xmpp_auto_reply.py) ===
 
@@ -431,12 +94,10 @@ class StudyMonitorPOC:
         self.message_queue = queue.Queue()
         self.polling_thread = None
         self.processor_thread = None
-        self.heartbeat_thread = None
         
         # Clario components (will be created in message processor thread)
-        self.clario_tool = None
+        self.clario_api = None
         self.clario_loop = None
-        self.clario_login_id = None
         self.clario_credentials = None  # Store credentials for later authentication
         
         # Track processed messages
@@ -494,7 +155,7 @@ class StudyMonitorPOC:
             auth_resp.raise_for_status()
             
             if "<success" not in auth_resp.text:
-                raise Exception("SASL Authentication failed")
+                raise AuthenticationError("SASL Authentication failed")
             print("[+] SASL Authentication successful")
             
             # Restart stream
@@ -521,7 +182,7 @@ class StudyMonitorPOC:
             jid_element = bind_tree.find('.//{urn:ietf:params:xml:ns:xmpp-bind}jid')
             
             if jid_element is None:
-                raise Exception("Resource binding failed")
+                raise ClarioAPIError("Resource binding failed")
             
             self.jid = jid_element.text
             print(f"[+] Bound to JID: {self.jid}")
@@ -589,145 +250,109 @@ class StudyMonitorPOC:
         print(f"[*] Authenticating with Clario as: {username}")
         
         try:
-            self.clario_tool = ClarionSearchTool(CLARIO_BASE_URL, username, password)
-            await self.clario_tool.connect()
+            self.clario_api = ClarioAPI(
+                base_url=CLARIO_BASE_URL, 
+                username=username, 
+                password=password,
+                log_level="INFO",
+                enable_heartbeat=True,
+                heartbeat_interval=30.0
+            )
+            await self.clario_api.connect()
+            user_info = await self.clario_api.login()
             
-            # Extract login_id for heartbeat functionality
-            if hasattr(self.clario_tool, 'session_token') and self.clario_tool.session_token:
-                self.clario_login_id = int(self.clario_tool.session_token)
-                print(f"[+] Clario authentication successful (login_id={self.clario_login_id})")
-            else:
-                print("[+] Clario authentication successful")
+            # Authentication successful - heartbeat is now managed automatically by ClarioAPI
+            print(f"[+] Clario authentication successful (login_id={self.clario_api.login_id})")
             
             return True
-        except Exception as e:
+        except AuthenticationError as e:
             print(f"❌ Clario authentication failed: {e}")
             return False
+        except ClarioAPIError as e:
+            print(f"❌ Clario API error: {e}")
+            return False
+        except Exception as e:
+            print(f"❌ Clario connection failed: {e}")
+            return False
     
-    async def _rpc_call(self, app: str, method: str, params: List, method_type: str = "direct"):
-        """Helper method for Clario RPC calls with detailed logging."""
-        if not self.clario_tool or not self.clario_tool.session:
-            raise Exception("Clario not connected")
+    
+    # Note: Manual heartbeat method removed - ClarioAPI now manages heartbeat automatically
+    
+    async def search_exam_by_accession(self, accession: str) -> List[Study]:
+        """Search for exams by accession number using SearchBuilder."""
+        logger.info("Searching for exam with accession: %s", accession)
         
-        # Match working client payload structure exactly
-        payload = {
-            "action": "rpc",
-            "method": method_type,
-            "data": [method, params],
-            "tid": self.clario_tool._get_next_transaction_id(),
-            "app": app,
-            "login": self.clario_login_id if self.clario_login_id else 0,
-        }
-        
-        # Debug logging for RPC requests (redact sensitive data)
-        debug_payload = {**payload, "data": [method, "[ARGS_REDACTED]" if params else []]}
-        logger.debug("RPC Request: %s", json.dumps(debug_payload, indent=2))
-        
-        rpc_url = f"/rpc/app.php?app={app}&sysClient="
-        logger.debug("RPC URL: %s", rpc_url)
+        if not self.clario_api or not self.clario_api.login_id:
+            raise AuthenticationError("Not logged in - no login ID")
         
         try:
-            status_code, response_data, headers = await self.clario_tool._make_request(
-                "POST", rpc_url, json=payload
-            )
+            # Use SearchBuilder for cleaner, more maintainable search
+            search = (self.clario_api.search()
+                     .advanced()
+                     .accession_number(accession)
+                     .limit(50)
+                     .sort_by("defaultDirectSorting", "DESC"))
             
-            logger.debug("RPC Response: status=%d, type=%s", status_code, type(response_data).__name__)
+            # Execute search using the new SearchBuilder interface
+            result = await self.clario_api.execute_search(search)
             
-            # Parse response like working client
-            if isinstance(response_data, list) and len(response_data) > 0:
-                result = response_data[0]
-                logger.debug("RPC response keys: %s", list(result.keys()) if isinstance(result, dict) else "non-dict")
-                
-                if "result" in result:
-                    logger.debug("RPC call successful (app=%s, method=%s)", app, method)
-                    return result["result"]
-                elif "error" in result:
-                    error_msg = result["error"]
-                    logger.error("RPC call failed (app=%s, method=%s): %s", app, method, error_msg)
-                    raise Exception(f"RPC Error: {error_msg}")
-                else:
-                    logger.error("No result or error in RPC response: %s", result)
-                    raise Exception(f"No result or error in RPC response: {result}")
+            # SearchResult is returned directly from execute_search
+            if result.success:
+                logger.info("Found %d studies for accession %s", len(result.studies), accession)
+                return result.studies
             else:
-                logger.error("Unexpected RPC response format (app=%s, method=%s): %s", app, method, response_data)
-                raise Exception(f"Unexpected response format: {response_data}")
-                
+                logger.warning("Search failed: %s", result.error)
+                return []
+            
+        except ClarioAPIError as e:
+            logger.error("Clario API error: %s", e)
+            raise
         except Exception as e:
-            logger.error("RPC call failed for %s.%s: %s", app, method, str(e))
+            logger.error("Search error: %s", e)
             raise
     
-    async def heartbeat(self) -> bool:
-        """Send keep-alive heartbeat to Clario."""
-        if not self.clario_login_id:
-            logger.debug("Heartbeat skipped - not logged in")
-            return False
-
-        logger.debug("Sending heartbeat for login_id: %d", self.clario_login_id)
-
-        try:
-            # Try using session preparation as heartbeat (matches working client pattern)
-            result = await self._rpc_call(
-                "login", "login/Prepare.user", [self.clario_login_id, None], method_type="direct"
-            )
-            logger.debug("Heartbeat successful (result=%s)", result)
-            return True
-        except Exception as e:
-            logger.error("Heartbeat failed: %s", str(e))
-            return False
-    
     async def get_patient_info(self, patient_id: str, exam_id: str) -> Dict[str, Any]:
-        """Get detailed patient information using Clario RPC."""
+        """Get detailed patient information using ClarioAPI monitoring endpoint."""
         logger.debug("Fetching patient info for patient_id: %s, exam_id: %s", patient_id, exam_id)
         
-        if not self.clario_login_id:
-            raise Exception("Not logged in - no login_id")
+        if not self.clario_api:
+            raise ClarioAPIError("Clario API not connected")
         
         try:
-            # Use exact RPC format provided by user
-            result = await self._rpc_call(
-                "workflow", ">workflow/patient/Info.get", [patient_id, exam_id, False], method_type="one"
-            )
-            
-            logger.debug("Patient info RPC successful")
-            
-            # Parse patient information from result.information
-            if isinstance(result, dict) and "information" in result:
-                patient_info = result["information"]
-                logger.debug("Patient demographics: %s", patient_info)
-                return patient_info
-            else:
-                logger.warning("No information section in patient info response: %s", result)
-                return {}
+            # Use clario_api monitoring endpoint only
+            patient_info = await self.clario_api.monitoring.get_patient_info(patient_id, exam_id)
+            logger.debug("Patient demographics: %s", patient_info)
+            return patient_info
                 
+        except ClarioAPIError as e:
+            logger.error("Clario API error getting patient info for patient_id=%s, exam_id=%s: %s", patient_id, exam_id, str(e))
+            return {}
         except Exception as e:
-            logger.error("Failed to get patient info for patient_id=%s, exam_id=%s: %s", patient_id, exam_id, str(e))
+            logger.error("Unexpected error getting patient info for patient_id=%s, exam_id=%s: %s", patient_id, exam_id, str(e))
             return {}
     
-    async def get_ordering_physician(self, exam_id: str) -> Dict[str, Any]:
-        """Get ordering physician details for an exam using Clario RPC."""
+    async def get_ordering_physician(self, exam_id: str, patient_id: str = None) -> Dict[str, Any]:
+        """Get ordering physician details using ClarioAPI monitoring endpoint."""
         logger.debug("Fetching ordering physician for exam_id: %s", exam_id)
         
-        if not self.clario_login_id:
-            raise Exception("Not logged in - no login_id")
+        if not self.clario_api:
+            raise ClarioAPIError("Clario API not connected")
+        
+        if not patient_id:
+            logger.error("patient_id required for monitoring endpoint")
+            return {}
         
         try:
-            # Use the RPC call from original clario_search_tool.py
-            result = await self._rpc_call(
-                "workflow", "workflow/patient/Exam.order", [exam_id], method_type="direct"
-            )
-            
-            logger.debug("Ordering physician RPC successful")
-            
-            # Return the full result for processing
-            if result:
-                logger.debug("Ordering physician data: %s", result)
-                return result
-            else:
-                logger.warning("No ordering physician data in response")
-                return {}
+            # Use clario_api monitoring endpoint only
+            physician_info = await self.clario_api.monitoring.get_ordering_physician(patient_id, exam_id)
+            logger.debug("Ordering physician data: %s", physician_info)
+            return physician_info
                 
+        except ClarioAPIError as e:
+            logger.error("Clario API error getting ordering physician for exam_id=%s, patient_id=%s: %s", exam_id, patient_id, str(e))
+            return {}
         except Exception as e:
-            logger.error("Failed to get ordering physician for exam_id=%s: %s", exam_id, str(e))
+            logger.error("Unexpected error getting ordering physician for exam_id=%s, patient_id=%s: %s", exam_id, patient_id, str(e))
             return {}
     
     def xor_encrypt(self, text: str, key: str) -> str:
@@ -970,7 +595,7 @@ class StudyMonitorPOC:
         
         # Look up patient details in Clario
         try:
-            studies = await self.clario_tool.search_exam_by_accession(accession)
+            studies = await self.search_exam_by_accession(accession)
             if studies:
                 # Get the first study and extract basic info
                 study = studies[0]
@@ -980,12 +605,12 @@ class StudyMonitorPOC:
                 patient_info = await self.get_patient_info(study.patient_id, study.exam_id)
                 
                 # Get ordering physician details
-                ordering_physician_info = await self.get_ordering_physician(study.exam_id)
+                ordering_physician_info = await self.get_ordering_physician(study.exam_id, study.patient_id)
                 
                 if patient_info:
                     patient_details = {
                         "mrn": patient_info.get("mrn", ""),
-                        "uli": getattr(study, '_external_mrn', ''),  # Still use external MRN from exam search
+                        "uli": study.external_mrn or "",  # Use proper Study model attribute
                         "dob": patient_info.get("dob", ""),  # From patient info RPC
                         "gender": patient_info.get("gender", ""),  # From patient info RPC
                         "patient_name": patient_info.get("name", study.patient_name),  # Prefer full name from patient info
@@ -997,8 +622,8 @@ class StudyMonitorPOC:
                 else:
                     # Fallback to basic study info if patient info RPC fails
                     patient_details = {
-                        "mrn": getattr(study, '_mrn', ''),
-                        "uli": getattr(study, '_external_mrn', ''),
+                        "mrn": study.mrn or "",  # Use proper Study model attribute
+                        "uli": study.external_mrn or "",  # Use proper Study model attribute
                         "dob": "",  # Empty if we can't get patient info
                         "gender": "",  # Empty if we can't get patient info
                         "patient_name": study.patient_name,
@@ -1031,8 +656,8 @@ class StudyMonitorPOC:
             }
         }
         
-        print("\\n📊 *** PATIENT LOOKUP RESULT ***")
-        print(json.dumps(output, indent=2))
+        logger.info("Patient lookup result for accession %s", accession)
+        logger.debug(json.dumps(output, indent=2))
         
         # Generate Google Forms link and send reply if we have patient details
         if patient_details:
@@ -1172,81 +797,26 @@ class StudyMonitorPOC:
         
         print("[DEBUG] XMPP polling thread stopped")
     
-    def heartbeat_worker(self):
-        """Clario heartbeat worker thread - sends periodic keep-alives."""
-        print("[DEBUG] Starting Clario heartbeat thread...")
-        
-        # Wait for message processor thread to set up event loop
-        print("[DEBUG] Waiting for message processor event loop to be ready...")
-        loop_wait_count = 0
-        while self.running and (not self.clario_loop or self.clario_loop.is_closed()):
-            time.sleep(1)
-            loop_wait_count += 1
-            if loop_wait_count % 5 == 0:  # Log every 5 seconds
-                print(f"[DEBUG] Still waiting for event loop... ({loop_wait_count}s)")
-            if loop_wait_count > 30:  # Give up after 30 seconds
-                print("[DEBUG] Timeout waiting for event loop - heartbeat disabled")
-                return
-        
-        if self.clario_loop:
-            print("[DEBUG] Event loop ready - heartbeat enabled")
-        
-        heartbeat_count = 0
-        
-        while self.running:
-            try:
-                if self.clario_login_id and self.clario_loop and not self.clario_loop.is_closed():
-                    heartbeat_count += 1
-                    print(f"[DEBUG] Sending Clario heartbeat #{heartbeat_count}")
-                    
-                    # Use the existing event loop from message processor thread
-                    future = asyncio.run_coroutine_threadsafe(self.heartbeat(), self.clario_loop)
-                    try:
-                        success = future.result(timeout=10)  # 10 second timeout
-                        if success:
-                            print(f"[DEBUG] Heartbeat #{heartbeat_count} successful")
-                        else:
-                            print(f"[DEBUG] Heartbeat #{heartbeat_count} failed")
-                    except Exception as e:
-                        print(f"[DEBUG] Heartbeat #{heartbeat_count} failed: {e}")
-                        
-                elif not self.clario_login_id:
-                    print("[DEBUG] Heartbeat skipped - no Clario login_id")
-                else:
-                    print("[DEBUG] Heartbeat skipped - event loop not available")
-                    break  # Exit if event loop becomes unavailable
-                
-                # Send heartbeat every 30 seconds
-                for i in range(30):
-                    if not self.running:
-                        break
-                    time.sleep(1)
-                    
-            except Exception as e:
-                print(f"❌ Heartbeat worker error: {e}")
-                time.sleep(10)  # Wait before retry
-        
-        print("[DEBUG] Clario heartbeat thread stopped")
-    
+    # Note: heartbeat_worker method removed - ClarioAPI now handles heartbeat automatically
     def message_processor(self):
         """Message processing worker thread."""
-        print("[DEBUG] Starting message processor thread...")
+        logger.debug("Starting message processor thread...")
         
         # Create event loop for Clario async operations
         self.clario_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.clario_loop)
-        print("[DEBUG] Message processor event loop created")
+        logger.debug("Message processor event loop created")
         
         # Authenticate with Clario in this thread's event loop
         if self.clario_credentials:
-            print("[DEBUG] Authenticating with Clario in message processor thread...")
+            logger.debug("Authenticating with Clario in message processor thread...")
             auth_success = self.clario_loop.run_until_complete(self.authenticate_clario_in_thread())
             if not auth_success:
-                print("❌ Failed to authenticate with Clario in message processor thread")
+                logger.error("Failed to authenticate with Clario in message processor thread")
                 self.clario_loop.close()
                 return
         else:
-            print("[DEBUG] No Clario credentials provided - Clario functionality disabled")
+            logger.debug("No Clario credentials provided - Clario functionality disabled")
         
         while self.running:
             try:
@@ -1283,11 +853,11 @@ class StudyMonitorPOC:
                 print(f"❌ Message processor error: {e}")
         
         # Close Clario client
-        if self.clario_tool:
-            self.clario_loop.run_until_complete(self.clario_tool.close())
+        if self.clario_api:
+            self.clario_loop.run_until_complete(self.clario_api.close())
         
         self.clario_loop.close()
-        print("[DEBUG] Message processor thread stopped")
+        logger.debug("Message processor thread stopped")
     
     def start_monitoring(self):
         """Start the monitoring system."""
@@ -1308,13 +878,7 @@ class StudyMonitorPOC:
             self.processor_thread.start()
             print("[DEBUG] Message processor thread started")
             
-            # Start heartbeat thread if we have Clario login
-            if self.clario_login_id:
-                self.heartbeat_thread = threading.Thread(target=self.heartbeat_worker, daemon=True)
-                self.heartbeat_thread.start()
-                print("[DEBUG] Clario heartbeat thread started")
-            else:
-                print("[DEBUG] Clario heartbeat thread skipped - no login_id")
+            # Note: Heartbeat is now managed automatically by ClarioAPI
             
             # Main loop with thread monitoring
             while self.running:
@@ -1325,8 +889,6 @@ class StudyMonitorPOC:
                     print("❌ XMPP polling thread died!")
                 if not self.processor_thread.is_alive():
                     print("❌ Message processor thread died!")
-                if self.heartbeat_thread and not self.heartbeat_thread.is_alive():
-                    print("❌ Clario heartbeat thread died!")
                 
         except KeyboardInterrupt:
             print("\\n[*] Stopping study monitoring...")
@@ -1340,10 +902,6 @@ class StudyMonitorPOC:
             if self.processor_thread and self.processor_thread.is_alive():
                 print("[DEBUG] Waiting for message processor thread...")
                 self.processor_thread.join(timeout=5)
-            
-            if self.heartbeat_thread and self.heartbeat_thread.is_alive():
-                print("[DEBUG] Waiting for heartbeat thread...")
-                self.heartbeat_thread.join(timeout=5)
             
             print("[DEBUG] All threads stopped")
 
