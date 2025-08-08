@@ -73,10 +73,6 @@ logger = setup_logging(
     mask_sensitive=True
 )
 
-# Note: ClarioSearchWrapper removed - now using ClarioAPI directly with async context manager
-
-# Note: RIDManager removed - now using ei_xmpp_api for XMPP management
-
 class StudyMonitorPOC:
     """Integrated XMPP + Clario study monitoring system."""
     
@@ -88,9 +84,6 @@ class StudyMonitorPOC:
         # Clario API client
         self.clario_api = None
     
-    # connect_xmpp method removed - now using ei_xmpp_api async context manager in main()
-    
-    # Note: set_high_priority_presence removed - now handled by ei_xmpp_api in connect_xmpp
     
     async def connect_clario(self, username: str, password: str) -> bool:
         """Connect to Clario API."""
@@ -122,8 +115,6 @@ class StudyMonitorPOC:
             print(f"❌ Clario connection failed: {e}")
             return False
     
-    
-    # Note: Manual heartbeat method removed - ClarioAPI now manages heartbeat automatically
     
     async def handle_message(self, message: Message) -> None:
         """Handle incoming XMPP messages - mostly for logging since ei_xmpp_api auto-detects study shares."""
@@ -284,7 +275,6 @@ class StudyMonitorPOC:
         
         return form_url
     
-    # extract_username_from_jid() method removed - now using ei_xmpp_api's parse_jid utility
     
     def extract_physician_name(self, ordering_physician_data: Dict[str, Any]) -> str:
         """Extract physician name from ordering physician RPC response."""
@@ -328,11 +318,6 @@ class StudyMonitorPOC:
             print(f"❌ Failed to send XMPP reply: {e}")
             return False
     
-    # Removed manual URL detection - now using ei_xmpp_api's detect_study_share_urls utility
-    
-    # Removed manual URL parsing - now using ei_xmpp_api's extract_study_info utility
-    
-    # extract_accession_from_procedure() method removed - now using ei_xmpp_api's robust extraction
     
     async def process_study_share_unified(self, from_jid: str, study_uid: str, procedure: str, share_url: str, accession: str):
         """Unified method to process study shares with patient lookup and Google Forms generation."""
@@ -441,11 +426,6 @@ class StudyMonitorPOC:
         else:
             print("\\n⚠️  No patient details available - skipping Google Forms link generation")
     
-    # Legacy BOSH polling code removed - replaced with ei_xmpp_api async monitoring
-    
-    # Old polling worker removed - replaced with ei_xmpp_api async message monitoring
-    
-    # Old message processor thread removed - replaced with ei_xmpp_api async handlers
     
     async def run_monitor(self, poll_interval: float = 2.0):
         """Run the async monitoring system using ei_xmpp_api."""
