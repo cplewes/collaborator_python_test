@@ -51,10 +51,7 @@ from enterprise_imaging_chat.exceptions import (
     ConnectionError as XMPPConnectionError,
     MessageError
 )
-from enterprise_imaging_chat.utils import (
-    detect_study_share_urls,
-    extract_study_info
-)
+from enterprise_imaging_chat.utils import parse_jid
 
 # === Configuration ===
 # Enterprise Imaging XMPP server
@@ -90,10 +87,6 @@ class StudyMonitorPOC:
         
         # Clario API client
         self.clario_api = None
-        self.clario_credentials = None  # Store credentials for later authentication
-        
-        # Track processed messages
-        self.processed_messages = set()
     
     # connect_xmpp method removed - now using ei_xmpp_api async context manager in main()
     
@@ -144,14 +137,15 @@ class StudyMonitorPOC:
         print(f"Study UID: {study.study_uid}")
         print(f"Procedure: {study.procedure}")
         
-        # Extract accession from procedure (last word)
-        accession = self.extract_accession_from_procedure(study.procedure)
+        # Use accession from ei_xmpp_api (already extracted and validated)
+        accession = study.accession_number
+        logger.debug(f"Using accession from ei_xmpp_api: '{accession}'")
         
         if not accession:
-            print("❌ Could not extract accession from procedure")
+            print("❌ No accession found in study share")
             return
         
-        # Process the study share using consolidated logic
+        # Process using ei_xmpp_api extracted accession
         await self.process_study_share_unified(study.shared_by, study.study_uid, study.procedure, study.share_url, accession)
     
     async def search_exam_by_accession(self, accession: str) -> List[Study]:
@@ -290,11 +284,7 @@ class StudyMonitorPOC:
         
         return form_url
     
-    def extract_username_from_jid(self, jid: str) -> str:
-        """Extract username from JID (e.g., 'kiranreddy' from 'kiranreddy@agfa.com/resource')."""
-        if '@' in jid:
-            return jid.split('@')[0]
-        return jid
+    # extract_username_from_jid() method removed - now using ei_xmpp_api's parse_jid utility
     
     def extract_physician_name(self, ordering_physician_data: Dict[str, Any]) -> str:
         """Extract physician name from ordering physician RPC response."""
@@ -344,24 +334,7 @@ class StudyMonitorPOC:
     
     # Removed manual URL parsing - now using ei_xmpp_api's extract_study_info utility
     
-    def extract_accession_from_procedure(self, procedure: str) -> Optional[str]:
-        """Extract accession number (last word) from procedure string."""
-        if not procedure:
-            print(f"[DEBUG] No procedure provided for accession extraction")
-            return None
-        
-        print(f"[DEBUG] Extracting accession from procedure: '{procedure}'")
-        
-        # Split by whitespace and get the last word
-        words = procedure.strip().split()
-        if words:
-            accession = words[-1]
-            print(f"[DEBUG] Extracted accession '{accession}' from procedure: {procedure}")
-            print(f"[DEBUG] All words in procedure: {words}")
-            return accession
-        else:
-            print(f"[DEBUG] No words found in procedure string")
-            return None
+    # extract_accession_from_procedure() method removed - now using ei_xmpp_api's robust extraction
     
     async def process_study_share_unified(self, from_jid: str, study_uid: str, procedure: str, share_url: str, accession: str):
         """Unified method to process study shares with patient lookup and Google Forms generation."""
@@ -438,8 +411,8 @@ class StudyMonitorPOC:
         if patient_details:
             print("\\n🔗 *** GENERATING GOOGLE FORMS LINK ***")
             
-            # Extract username from sender JID
-            username = self.extract_username_from_jid(from_jid)
+            # Extract username from sender JID using ei_xmpp_api utility
+            username = parse_jid(from_jid)["username"]
             
             # Extract physician name from ordering physician data
             ordering_physician = patient_details.get('ordering_physician', {})
@@ -548,14 +521,7 @@ async def main():
         
         async with monitor.xmpp_client:
             print(f"[+] Connected to XMPP as {monitor.xmpp_client.bound_jid}")
-            
-            # Set high priority presence
-            await monitor.xmpp_client.set_presence(
-                status="Study Monitor POC active",
-                show="online",
-                priority=10
-            )
-            print("[+] High priority presence set")
+            print("[+] High priority presence set automatically by ei_xmpp_api")
             
             # Connect to Clario
             if not await monitor.connect_clario(clario_username, clario_password):
