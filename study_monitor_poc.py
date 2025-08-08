@@ -358,7 +358,7 @@ class StudyMonitorPOC:
                 if patient_info:
                     patient_details = {
                         "mrn": patient_info.get("mrn", ""),
-                        "uli": study.external_mrn or "",  # Use proper Study model attribute
+                        "uli": study.get_external_mrn() or "",  # Use proper Study model method
                         "dob": patient_info.get("dob", ""),  # From patient info RPC
                         "gender": patient_info.get("gender", ""),  # From patient info RPC
                         "patient_name": patient_info.get("name", study.patient_name),  # Prefer full name from patient info
@@ -370,8 +370,8 @@ class StudyMonitorPOC:
                 else:
                     # Fallback to basic study info if patient info RPC fails
                     patient_details = {
-                        "mrn": study.mrn or "",  # Use proper Study model attribute
-                        "uli": study.external_mrn or "",  # Use proper Study model attribute
+                        "mrn": study.get_mrn() or "",  # Use proper Study model method
+                        "uli": study.get_external_mrn() or "",  # Use proper Study model method
                         "dob": "",  # Empty if we can't get patient info
                         "gender": "",  # Empty if we can't get patient info
                         "patient_name": study.patient_name,
