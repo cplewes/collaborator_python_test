@@ -291,18 +291,16 @@ class StudyMonitorPOC:
         if not ordering_physician_data:
             return ""
         
-        # Extract from the known structure: result.values.ordering
-        values = ordering_physician_data.get("values", {})
-        if values:
-            print(f"[DEBUG] Processing ordering physician values: {list(values.keys())}")
+        print(f"[DEBUG] Processing ordering physician data: {list(ordering_physician_data.keys())}")
         
-        ordering_physician = values.get("ordering", "")
+        # Extract from current API structure: direct 'ordering' key
+        ordering_physician = ordering_physician_data.get("ordering", "")
         
         if ordering_physician:
             print(f"[DEBUG] Found ordering physician: {ordering_physician}")
             return ordering_physician.strip()
         
-        print("[DEBUG] No ordering physician found in values.ordering")
+        print("[DEBUG] No ordering physician found")
         return ""
     
     async def send_xmpp_reply(self, to_jid: str, message: str) -> bool:
